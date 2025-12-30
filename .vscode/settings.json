@@ -1,0 +1,11 @@
+{
+  "files.watcherExclude": {
+    "**/.pio/**": true,
+    "**/.pioenvs/**": true,
+    "**/.piolibdeps/**": true
+  },
+  "files.exclude": {
+    "**/.pio": false
+  }
+}
+
