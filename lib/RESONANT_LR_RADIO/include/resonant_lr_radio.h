@@ -107,13 +107,13 @@ public:
     void onError(ErrorCallback cb);
     
     // ========================================================================
-    // TX Operations (called from main)
+    // TX Operations (called from main - sets flags, Core 0 executes)
     // ========================================================================
     bool send(uint8_t* data, size_t size);
     bool send(uint8_t* data, size_t size, uint8_t destinationID[4], bool ackRequired);
     
     // ========================================================================
-    // RX Operations
+    // RX Operations (sets flags, Core 0 executes)
     // ========================================================================
     void startRx(uint32_t timeout = 0);
     void stopRx();
@@ -127,7 +127,7 @@ public:
     bool isTransmissionComplete() const;
     
     // ========================================================================
-    // Power management
+    // Power management (sets flags, Core 0 executes)
     // ========================================================================
     void sleep();
     void wake();
@@ -135,7 +135,7 @@ public:
     void lightSleep();
     
     // ========================================================================
-    // Loop function (call from main loop for IRQ processing)
+    // Loop function (called from Core 0 backgroundTasks)
     // ========================================================================
     void loop();
     
@@ -151,7 +151,63 @@ public:
     // Multi-packet TX settings (set before calling send())
     bool multiPacketFrameAckRequired = false;
     uint8_t multiPacketDestinationID[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+    
+    // ========================================================================
+    // Core 0 Initialization Flag (set by Core 0 after init completes)
+    // ========================================================================
+    volatile bool radioInitialized = false;
+    
+    // ========================================================================
+    // Request Flags (Core 1 sets, Core 0 reads and clears)
+    // ========================================================================
+    volatile bool sendRequested = false;
+    volatile bool startRxRequested = false;
+    volatile bool stopRxRequested = false;
+    volatile bool configChangeRequested = false;
+    volatile bool sleepRequested = false;
+    volatile bool deepSleepRequested = false;
+    
+    // Pending send data (copied when send() is called from Core 1)
+    uint8_t* pendingSendData = nullptr;
+    size_t pendingSendSize = 0;
+    uint8_t pendingDestID[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+    bool pendingAckRequired = false;
+    
+    // Pending RX timeout
+    uint32_t pendingRxTimeout = 0;
+    
+    // Pending config change
+    RadioConfig pendingConfig;
+    
+    // ========================================================================
+    // Result Flags (Core 0 sets, Core 1 reads - callbacks fired from Core 0)
+    // ========================================================================
+    volatile bool txCompleteFlag = false;
+    volatile bool txSuccessFlag = false;
+    volatile size_t txBytesSentFlag = 0;
+    volatile uint8_t txPacketCountFlag = 0;
+    
+    volatile bool rxDataReadyFlag = false;
+    uint8_t rxDataBuffer[512];  // Buffer for received data
+    size_t rxDataSizeFlag = 0;
+    int16_t rxRssiFlag = 0;
+    int8_t rxSnrFlag = 0;
+    ValidateFrameResult rxResultFlag;
+    
+    volatile bool errorOccurredFlag = false;
+    volatile uint8_t lastErrorCodeFlag = 0;
+    const char* lastErrorMessageFlag = nullptr;
 
+    // ========================================================================
+    // Process Requests (called from Core 0 loop)
+    // ========================================================================
+    void processRequests();
+    
+    // ========================================================================
+    // Helper Methods
+    // ========================================================================
+    static const char* getErrorMessage(uint8_t errorCode);
+    
 private:
     // ========================================================================
     // Pin Configuration (RAK3112)
@@ -167,12 +223,18 @@ private:
     static constexpr int LORA_RXEN_PIN = -1;
     
     // ========================================================================
-    // Core 0 Task
+    // Core 0 Task (no longer used - backgroundTasks in main.cpp handles this)
     // ========================================================================
     static void radioTaskFunc(void* param);
     TaskHandle_t radioTaskHandle = nullptr;
     static constexpr int RADIO_TASK_STACK_SIZE = 4096;
     static constexpr int RADIO_TASK_PRIORITY = 1;
+    
+    // ========================================================================
+    // Internal Execute Methods (called from Core 0 only)
+    // ========================================================================
+    void executeSend(uint8_t* data, size_t size, uint8_t destinationID[4], bool ackRequired);
+    void applyConfigInternal();  // Internal version without mutex
     
     // ========================================================================
     // Thread Safety

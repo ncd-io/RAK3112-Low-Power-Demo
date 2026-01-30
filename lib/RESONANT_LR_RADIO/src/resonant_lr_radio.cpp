@@ -95,49 +95,23 @@ bool ResonantLRRadio::init(ResonantFrame* frame, const RadioConfig& config) {
     // Apply configuration
     applyConfig();
     
-    // NOTE: Core 0 task disabled for now - using loop() from main instead
-    // This is because SX126x library may not be thread-safe
-    // TODO: Re-enable Core 0 task with proper synchronization
-    
-    /*
-    // Create radio task on Core 0
-    BaseType_t result = xTaskCreatePinnedToCore(
-        radioTaskFunc,
-        "RadioTask",
-        RADIO_TASK_STACK_SIZE,
-        this,
-        RADIO_TASK_PRIORITY,
-        &radioTaskHandle,
-        0  // Core 0
-    );
-    
-    if (result != pdPASS) {
-        Serial1.println("Failed to create radio task");
-        return false;
-    }
-    
-    // Setup DIO1 interrupt (ESP32 uses pin number directly)
-    pinMode(LORA_DIO_1_PIN, INPUT);
-    attachInterrupt(LORA_DIO_1_PIN, dio1ISR, RISING);
-    
-    Serial1.println("ResonantLRRadio initialized on Core 0");
-    */
-    
+    // Radio is now initialized - backgroundTasks in main.cpp will call loop()
+    // The task should be pinned to Core 0 for thread-safe radio operations
     initialized = true;
-    Serial1.println("ResonantLRRadio initialized (call loop() from main)");
+    radioInitialized = true;  // Signal to Core 1 that init is complete
+    Serial1.println("ResonantLRRadio initialized on Core 0");
     return true;
 }
 
 // ============================================================================
-// Configuration
+// Configuration (called from Core 1 - sets flags, Core 0 executes)
 // ============================================================================
 
 void ResonantLRRadio::setConfig(const RadioConfig& config) {
-    if (xSemaphoreTake(configMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
-        currentConfig = config;
-        xSemaphoreGive(configMutex);
-        applyConfig();
-    }
+    // Copy config to pending and set flag - Core 0 will apply it
+    pendingConfig = config;
+    configChangeRequested = true;
+    Serial1.println("Config change request queued");
 }
 
 RadioConfig ResonantLRRadio::getConfig() {
@@ -248,7 +222,7 @@ void ResonantLRRadio::onError(ErrorCallback cb) {
 }
 
 // ============================================================================
-// TX Operations
+// TX Operations (called from Core 1 - sets flags, Core 0 executes)
 // ============================================================================
 
 bool ResonantLRRadio::send(uint8_t* data, size_t size) {
@@ -256,25 +230,55 @@ bool ResonantLRRadio::send(uint8_t* data, size_t size) {
 }
 
 bool ResonantLRRadio::send(uint8_t* data, size_t size, uint8_t destinationID[4], bool ackRequired) {
-    if (!initialized || transmissionInProgress) {
+    // Check if previous send is still pending
+    if (sendRequested) {
+        Serial1.println("Send rejected: previous send still pending");
         return false;
     }
     
-    if (xSemaphoreTake(txMutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+    // Check if radio is initialized and not busy
+    if (!radioInitialized || transmissionInProgress) {
+        Serial1.println("Send rejected: not initialized or transmission in progress");
         return false;
     }
     
+    // Copy data to pending buffer (Core 0 will process it)
+    if (pendingSendData != nullptr) {
+        delete[] pendingSendData;
+    }
+    pendingSendData = new uint8_t[size];
+    if (pendingSendData == nullptr) {
+        Serial1.println("Send rejected: failed to allocate pending buffer");
+        return false;
+    }
+    memcpy(pendingSendData, data, size);
+    pendingSendSize = size;
+    memcpy(pendingDestID, destinationID, 4);
+    pendingAckRequired = ackRequired;
+    
+    // Set flag - Core 0 will process this request
+    sendRequested = true;
+    
+    Serial1.printf("Send request queued: %zu bytes\n", size);
+    return true;
+}
+
+// ============================================================================
+// TX Execute (called from Core 0 only)
+// ============================================================================
+
+void ResonantLRRadio::executeSend(uint8_t* data, size_t size, uint8_t destinationID[4], bool ackRequired) {
     // Copy destination ID
     memcpy(multiPacketDestinationID, destinationID, 4);
     multiPacketFrameAckRequired = ackRequired;
     
-    if (size > maxPacketSize) {
+    if (size > (size_t)maxPacketSize) {
         // Multi-packet transmission
-        Serial1.printf("Starting multi-packet TX: %zu bytes\n", size);
+        Serial1.printf("Executing multi-packet TX: %zu bytes\n", size);
         multiPacketTxBuffer = new uint8_t[size];
         if (multiPacketTxBuffer == nullptr) {
-            xSemaphoreGive(txMutex);
-            return false;
+            Serial1.println("Failed to allocate multi-packet buffer");
+            return;
         }
         multiPacketTxBufferSize = size;
         multiPacketTxTotalPackets = (size + maxPacketSize - 1) / maxPacketSize;
@@ -285,14 +289,11 @@ bool ResonantLRRadio::send(uint8_t* data, size_t size, uint8_t destinationID[4],
         sendNextMultiPacket();
     } else {
         // Single packet transmission
-        Serial1.printf("Single packet TX: %zu bytes\n", size);
+        Serial1.printf("Executing single packet TX: %zu bytes\n", size);
         transmissionInProgress = true;
         Radio.Send(data, size);
         transmissionCount++;
     }
-    
-    xSemaphoreGive(txMutex);
-    return true;
 }
 
 void ResonantLRRadio::sendNextMultiPacket() {
@@ -348,18 +349,18 @@ bool ResonantLRRadio::continueMultiPacketTransmission() {
 }
 
 // ============================================================================
-// RX Operations
+// RX Operations (called from Core 1 - sets flags, Core 0 executes)
 // ============================================================================
 
 void ResonantLRRadio::startRx(uint32_t timeout) {
-    Radio.Standby();
-    receiveInProgress = true;
-    Radio.Rx(timeout);
+    pendingRxTimeout = timeout;
+    startRxRequested = true;
+    Serial1.printf("RX start request queued: timeout=%lu ms\n", timeout);
 }
 
 void ResonantLRRadio::stopRx() {
-    Radio.Standby();
-    receiveInProgress = false;
+    stopRxRequested = true;
+    Serial1.println("RX stop request queued");
 }
 
 // ============================================================================
@@ -383,20 +384,23 @@ bool ResonantLRRadio::isTransmissionComplete() const {
 }
 
 // ============================================================================
-// Power Management
+// Power Management (called from Core 1 - sets flags, Core 0 executes)
 // ============================================================================
 
 void ResonantLRRadio::sleep() {
-    Radio.Standby();
-    Radio.Sleep();
+    sleepRequested = true;
+    Serial1.println("Sleep request queued");
 }
 
 void ResonantLRRadio::wake() {
+    // Wake is synchronous since we need to wait for config to be applied
     Radio.Standby();
     applyConfig();
 }
 
 void ResonantLRRadio::deepSleep() {
+    // Deep sleep puts radio to sleep and prepares for ESP32 deep sleep
+    // This is called just before esp_deep_sleep_start() so we execute directly
     Radio.Standby();
     Radio.Sleep();
     SPI.end();
@@ -425,11 +429,186 @@ void ResonantLRRadio::lightSleep() {
 }
 
 // ============================================================================
-// Loop function (call from main loop)
+// Process Requests (called from Core 0 loop)
+// ============================================================================
+
+void ResonantLRRadio::processRequests() {
+    // Process send request
+    if (sendRequested) {
+        executeSend(pendingSendData, pendingSendSize, pendingDestID, pendingAckRequired);
+        
+        // Cleanup pending data after execution
+        if (pendingSendData != nullptr) {
+            delete[] pendingSendData;
+            pendingSendData = nullptr;
+        }
+        pendingSendSize = 0;
+        
+        sendRequested = false;
+    }
+    
+    // Process RX start request
+    if (startRxRequested) {
+        Radio.Standby();
+        receiveInProgress = true;
+        Radio.Rx(pendingRxTimeout);
+        startRxRequested = false;
+    }
+    
+    // Process RX stop request
+    if (stopRxRequested) {
+        Radio.Standby();
+        receiveInProgress = false;
+        stopRxRequested = false;
+    }
+    
+    // Process config change request
+    if (configChangeRequested) {
+        currentConfig = pendingConfig;
+        applyConfigInternal();
+        configChangeRequested = false;
+    }
+    
+    // Process sleep request
+    if (sleepRequested) {
+        Radio.Standby();
+        Radio.Sleep();
+        sleepRequested = false;
+    }
+    
+    // Always process radio IRQs
+    Radio.IrqProcess();
+}
+
+// ============================================================================
+// Internal Apply Config (without mutex, called from Core 0)
+// ============================================================================
+
+void ResonantLRRadio::applyConfigInternal() {
+    Radio.Standby();
+    Radio.SetChannel(currentConfig.frequency);
+    
+    if (currentConfig.modem == MODEM_LORA_MODE) {
+        Radio.SetTxConfig(
+            MODEM_LORA,
+            currentConfig.txPower,
+            0,  // frequency deviation (not used for LoRa)
+            currentConfig.loraBandwidth,
+            currentConfig.loraSpreadingFactor,
+            currentConfig.loraCodingRate,
+            currentConfig.loraPreambleLength,
+            currentConfig.loraFixLengthPayload,
+            currentConfig.crcOn,
+            false,  // frequency hopping
+            0,      // hop period
+            currentConfig.loraIqInversion,
+            currentConfig.txTimeout
+        );
+        
+        Radio.SetRxConfig(
+            MODEM_LORA,
+            currentConfig.loraBandwidth,
+            currentConfig.loraSpreadingFactor,
+            currentConfig.loraCodingRate,
+            0,  // AFC bandwidth (not used for LoRa)
+            currentConfig.loraPreambleLength,
+            0,  // symbol timeout
+            currentConfig.loraFixLengthPayload,
+            0,  // payload length (variable)
+            currentConfig.crcOn,
+            false,  // frequency hopping
+            0,      // hop period
+            currentConfig.loraIqInversion,
+            true    // continuous RX
+        );
+        Serial1.printf("Config applied (internal): LoRa SF%d BW%d\n", 
+            currentConfig.loraSpreadingFactor,
+            currentConfig.loraBandwidth == 0 ? 125 : (currentConfig.loraBandwidth == 1 ? 250 : 500));
+    } else {
+        // FSK mode
+        Radio.SetTxConfig(
+            MODEM_FSK,
+            currentConfig.txPower,
+            currentConfig.fskDeviation,
+            currentConfig.fskBandwidth,
+            currentConfig.fskDatarate,
+            0,  // coderate (not used for FSK)
+            currentConfig.loraPreambleLength,
+            false,  // fixed length
+            currentConfig.crcOn,
+            false,  // frequency hopping
+            0,      // hop period
+            false,  // IQ inversion
+            currentConfig.txTimeout
+        );
+        
+        Radio.SetRxConfig(
+            MODEM_FSK,
+            currentConfig.fskBandwidth,
+            currentConfig.fskDatarate,
+            0,  // coderate
+            currentConfig.fskDeviation,
+            currentConfig.loraPreambleLength,
+            0,  // symbol timeout
+            false,  // fixed length
+            0,  // payload length
+            currentConfig.crcOn,
+            false,  // frequency hopping
+            0,      // hop period
+            false,  // IQ inversion
+            true    // continuous RX
+        );
+        Serial1.printf("Config applied (internal): FSK %d bps\n", currentConfig.fskDatarate);
+    }
+}
+
+// ============================================================================
+// Get Error Message Helper
+// ============================================================================
+
+const char* ResonantLRRadio::getErrorMessage(uint8_t errorCode) {
+    switch (errorCode) {
+        case RADIO_ERROR_INIT_FAILED: return "Radio init failed";
+        case RADIO_ERROR_TX_TIMEOUT: return "TX timeout";
+        case RADIO_ERROR_RX_TIMEOUT: return "RX timeout";
+        case RADIO_ERROR_RX_ERROR: return "RX error";
+        case RADIO_ERROR_RX_ACCUMULATION_TIMEOUT: return "Multi-packet RX timeout";
+        default: return "Unknown error";
+    }
+}
+
+// ============================================================================
+// Loop function (called from Core 0 backgroundTasks)
 // ============================================================================
 
 void ResonantLRRadio::loop() {
-    Radio.IrqProcess();
+    // Process pending requests and IRQs
+    processRequests();
+    
+    // Check and fire callbacks based on result flags
+    if (txCompleteFlag) {
+        txCompleteFlag = false;
+        if (txCompleteCallback) {
+            txCompleteCallback(txSuccessFlag, txBytesSentFlag, txPacketCountFlag);
+        }
+    }
+    
+    if (rxDataReadyFlag) {
+        rxDataReadyFlag = false;
+        if (rxCompleteCallback) {
+            rxCompleteCallback(rxResultFlag, rxDataBuffer, rxDataSizeFlag, rxRssiFlag, rxSnrFlag);
+        }
+    }
+    
+    if (errorOccurredFlag) {
+        errorOccurredFlag = false;
+        if (errorCallback) {
+            errorCallback(lastErrorCodeFlag, getErrorMessage(lastErrorCodeFlag));
+        }
+    }
+    
+    // Check RX accumulation timeout
+    checkRxAccumulationTimeout();
 }
 
 // ============================================================================
@@ -521,23 +700,30 @@ void ResonantLRRadio::accumulateMultiPacket(ValidateFrameResult& result, int16_t
     // Check if all packets received
     uint8_t expectedMask = (1 << rxExpectedPackets) - 1;
     if (rxReceivedPacketsMask == expectedMask) {
-        Serial1.println("All packets received, firing callback");
+        Serial1.println("All packets received, setting callback flags");
+        
+        // Copy accumulated data to result buffer
+        size_t copySize = rxAccumulatedSize;
+        if (copySize > sizeof(rxDataBuffer)) {
+            copySize = sizeof(rxDataBuffer);
+        }
+        memcpy(rxDataBuffer, rxAccumulationBuffer, copySize);
         
         // Create result for callback
-        ValidateFrameResult completeResult;
-        completeResult.validChecksum = true;
-        completeResult.isIntendedDestination = true;
-        completeResult.frameType = resonantFrame->multiPacketFrameType;
-        completeResult.totalPackets = rxExpectedPackets;
-        completeResult.dataLength = rxAccumulatedSize;
-        completeResult.data = rxAccumulationBuffer;
-        memcpy(completeResult.sourceID, result.sourceID, 4);
-        memcpy(completeResult.destinationID, result.destinationID, 4);
+        rxResultFlag.validChecksum = true;
+        rxResultFlag.isIntendedDestination = true;
+        rxResultFlag.frameType = resonantFrame->multiPacketFrameType;
+        rxResultFlag.totalPackets = rxExpectedPackets;
+        rxResultFlag.dataLength = copySize;
+        rxResultFlag.data = rxDataBuffer;  // Point to our buffer
+        memcpy(rxResultFlag.sourceID, result.sourceID, 4);
+        memcpy(rxResultFlag.destinationID, result.destinationID, 4);
         
-        // Fire callback
-        if (rxCompleteCallback) {
-            rxCompleteCallback(completeResult, rxAccumulationBuffer, rxAccumulatedSize, rxLastRssi, rxLastSnr);
-        }
+        // Set result flags
+        rxDataSizeFlag = copySize;
+        rxRssiFlag = rxLastRssi;
+        rxSnrFlag = rxLastSnr;
+        rxDataReadyFlag = true;  // Signal ready
         
         // Cleanup
         clearRxAccumulation();
@@ -548,9 +734,11 @@ void ResonantLRRadio::checkRxAccumulationTimeout() {
     if (rxAccumulationBuffer != nullptr) {
         if (millis() - rxSessionStartTime > rxSessionTimeout) {
             Serial1.println("RX accumulation timeout");
-            if (errorCallback) {
-                errorCallback(RADIO_ERROR_RX_ACCUMULATION_TIMEOUT, "Multi-packet RX timeout");
-            }
+            
+            // Set error flag
+            lastErrorCodeFlag = RADIO_ERROR_RX_ACCUMULATION_TIMEOUT;
+            errorOccurredFlag = true;
+            
             clearRxAccumulation();
         }
     }
@@ -569,7 +757,8 @@ void ResonantLRRadio::clearRxAccumulation() {
 }
 
 // ============================================================================
-// Internal Radio Event Handlers (static, called from radio library)
+// Internal Radio Event Handlers (static, called from radio library on Core 0)
+// These set flags which are processed by loop() to fire callbacks
 // ============================================================================
 
 void ResonantLRRadio::internalOnTxDone() {
@@ -581,18 +770,17 @@ void ResonantLRRadio::internalOnTxDone() {
         return;
     }
     
-    // Transmission complete
+    // Transmission complete - set result flags
     g_radioInstance->transmissionInProgress = false;
     
-    if (g_radioInstance->txCompleteCallback) {
-        size_t bytesSent = g_radioInstance->lastMultiPacketDataSize > 0 
-            ? g_radioInstance->lastMultiPacketDataSize 
-            : 0;  // Single packet size not tracked currently
-        uint8_t packetCount = g_radioInstance->lastMultiPacketCount > 0 
-            ? g_radioInstance->lastMultiPacketCount 
-            : 1;
-        g_radioInstance->txCompleteCallback(true, bytesSent, packetCount);
-    }
+    g_radioInstance->txSuccessFlag = true;
+    g_radioInstance->txBytesSentFlag = g_radioInstance->lastMultiPacketDataSize > 0 
+        ? g_radioInstance->lastMultiPacketDataSize 
+        : 0;  // Single packet size not tracked currently
+    g_radioInstance->txPacketCountFlag = g_radioInstance->lastMultiPacketCount > 0 
+        ? g_radioInstance->lastMultiPacketCount 
+        : 1;
+    g_radioInstance->txCompleteFlag = true;  // Set this last to signal ready
 }
 
 void ResonantLRRadio::internalOnRxDone(uint8_t* payload, uint16_t size, int16_t rssi, int8_t snr) {
@@ -612,10 +800,20 @@ void ResonantLRRadio::internalOnRxDone(uint8_t* payload, uint16_t size, int16_t 
     if (result.frameType == g_radioInstance->resonantFrame->multiPacketFrameType) {
         g_radioInstance->accumulateMultiPacket(result, rssi, snr);
     } else {
-        // Single packet - fire callback immediately
-        if (g_radioInstance->rxCompleteCallback) {
-            g_radioInstance->rxCompleteCallback(result, result.data, result.dataLength, rssi, snr);
+        // Single packet - set result flags for callback
+        // Copy data to result buffer
+        size_t copySize = result.dataLength;
+        if (copySize > sizeof(g_radioInstance->rxDataBuffer)) {
+            copySize = sizeof(g_radioInstance->rxDataBuffer);
         }
+        memcpy(g_radioInstance->rxDataBuffer, result.data, copySize);
+        
+        g_radioInstance->rxDataSizeFlag = copySize;
+        g_radioInstance->rxRssiFlag = rssi;
+        g_radioInstance->rxSnrFlag = snr;
+        g_radioInstance->rxResultFlag = result;
+        g_radioInstance->rxResultFlag.data = g_radioInstance->rxDataBuffer;  // Point to our buffer
+        g_radioInstance->rxDataReadyFlag = true;  // Set this last to signal ready
     }
 }
 
@@ -633,13 +831,15 @@ void ResonantLRRadio::internalOnTxTimeout() {
         g_radioInstance->multiPacketTxPacketIndex = 0;
     }
     
-    if (g_radioInstance->txCompleteCallback) {
-        g_radioInstance->txCompleteCallback(false, 0, 0);
-    }
+    // Set TX complete with failure
+    g_radioInstance->txSuccessFlag = false;
+    g_radioInstance->txBytesSentFlag = 0;
+    g_radioInstance->txPacketCountFlag = 0;
+    g_radioInstance->txCompleteFlag = true;
     
-    if (g_radioInstance->errorCallback) {
-        g_radioInstance->errorCallback(RADIO_ERROR_TX_TIMEOUT, "TX timeout");
-    }
+    // Also set error flag
+    g_radioInstance->lastErrorCodeFlag = RADIO_ERROR_TX_TIMEOUT;
+    g_radioInstance->errorOccurredFlag = true;
 }
 
 void ResonantLRRadio::internalOnRxTimeout() {
@@ -647,9 +847,9 @@ void ResonantLRRadio::internalOnRxTimeout() {
     
     g_radioInstance->receiveInProgress = false;
     
-    if (g_radioInstance->errorCallback) {
-        g_radioInstance->errorCallback(RADIO_ERROR_RX_TIMEOUT, "RX timeout");
-    }
+    // Set error flag
+    g_radioInstance->lastErrorCodeFlag = RADIO_ERROR_RX_TIMEOUT;
+    g_radioInstance->errorOccurredFlag = true;
 }
 
 void ResonantLRRadio::internalOnRxError() {
@@ -657,7 +857,7 @@ void ResonantLRRadio::internalOnRxError() {
     
     g_radioInstance->receiveInProgress = false;
     
-    if (g_radioInstance->errorCallback) {
-        g_radioInstance->errorCallback(RADIO_ERROR_RX_ERROR, "RX error");
-    }
+    // Set error flag
+    g_radioInstance->lastErrorCodeFlag = RADIO_ERROR_RX_ERROR;
+    g_radioInstance->errorOccurredFlag = true;
 }

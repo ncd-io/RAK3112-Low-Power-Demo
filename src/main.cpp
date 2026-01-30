@@ -1,78 +1,45 @@
 #include "main.h"
 
 // ============================================================================
-// Global Instances
+// RTC Memory Variable (survives deep sleep - must be defined in .cpp)
 // ============================================================================
-ResonantLRRadio radio;
-ResonantFrame resonantFrame;
-
-// ============================================================================
-// Application State
-// ============================================================================
-volatile bool shouldSleep = false;
-volatile bool transmissionComplete = false;
-
-bool metricsAckRequired = false;
-bool multiPacketDemo = true;
-
-// ============================================================================
-// Timing & Energy Tracking
-// ============================================================================
-unsigned long wakeTimeout = 5000;
-unsigned long preTxTime = 0;
-unsigned long txStartTime = 0;
-unsigned long timeOnAir = 0;
-unsigned long ackStartTime = 0;
-unsigned long ackTime = 0;
-
-float preTxCurrentDraw = 40.7;
-float txCurrentDraw = 153.0;
-float ackCurrentDraw = 69.3;
-
 RTC_DATA_ATTR float energyBuffer = 0.0f;
 
 // ============================================================================
-// Test Data (Genesis text for multi-packet demo)
-// ============================================================================
-const char* genesis = "\nIn the beginning God created the heaven and the earth.\nAnd the earth was without form, and void; and darkness was upon the face of the deep. And the Spirit of God moved upon the face of the waters.\nAnd God said, Let there be light: and there was light.\nAnd God saw the light, that it was good: and God divided the light from the darkness.\nAnd God called the light Day, and the darkness he called Night. And the evening and the morning were the first day.\nAnd God said, Let there be a firmament in the midst of the waters, and let it divide the waters from the waters.\nAnd God made the firmament, and divided the waters which were under the firmament from the waters which were above the firmament: and it was so.\nAnd God called the firmament Heaven. And the evening and the morning were the second day.\nAnd God said, Let the waters under the heaven be gathered together unto one place, and let the dry land appear: and it was so.\nAnd God called the dry land Earth; and the gathering together of the waters called he Seas: and God saw that it was good.\nAnd God said, Let the earth bring forth grass, the herb yielding seed, and the fruit tree yielding fruit after his kind, whose seed is in itself, upon the earth: and it was so.\nAnd the earth brought forth grass, and herb yielding seed after his kind, and the tree yielding fruit, whose seed was in itself, after his kind: and God saw that it was good.\nAnd the evening and the morning were the third day.\nAnd God said, Let there be lights in the firmament of the heaven to divide the day from the night; and let them be for signs, and for seasons, and for days, and years:\nAnd let them be for lights in the firmament of the heaven to give light upon the earth: and it was so.\nAnd God made two great lights; the greater light to rule the day, and the lesser light to rule the night: he made the stars also.\nAnd God set them in the firmament of the heaven to give light upon the earth,\nAnd to rule over the day and over the night, and to divide the light from the darkness: and God saw that it was good.\nAnd the evening and the morning were the fourth day.";
-
-// ============================================================================
-// Setup
+// Setup (runs on Core 1)
 // ============================================================================
 void setup()
 {
     Serial1.begin(115200, SERIAL_8N1, PIN_SERIAL1_RX, PIN_SERIAL1_TX);
     Serial1.println("\n========================================");
     Serial1.println("RAK3112 ResonantLRRadio Demo");
+    Serial1.println("Core 0 Radio Execution");
     Serial1.println("========================================");
 
-    // Choose configuration based on demo mode
-    RadioConfig config;
-    if (multiPacketDemo) {
-        // Use FSK for bulk transfer (faster for large data)
-        config = ResonantLRRadio::getFskBulkPreset();
-        Serial1.println("Using FSK Bulk Transfer preset");
-    } else {
-        // Use LoRa for telemetry (better range for small packets)
-        config = ResonantLRRadio::getLoRaTelemetryPreset();
-        Serial1.println("Using LoRa Telemetry preset");
-    }
+    // Create radio task on CORE 0 - radio init happens there
+    xTaskCreatePinnedToCore(backgroundTasks, "RadioTask", 20000, NULL, 1, &backgroundTask, 0);
+    //                                                                                      ^ Core 0!
+    Serial1.println("Waiting for radio initialization on Core 0...");
 
-    // Initialize radio with ResonantFrame and config
-    if (!radio.init(&resonantFrame, config)) {
-        Serial1.println("ERROR: Radio initialization failed!");
-        return;
+    // Wait for radio to initialize on Core 0
+	//This is dangerous, because it will hang the program if the radio does not initialize  Check millis() against wakeTimeout
+    while (!resonantRadio.radioInitialized && millis() < wakeTimeout) {
+        delay(10);
     }
-    Serial1.println("Radio initialized successfully");
+	if(!resonantRadio.radioInitialized) {
+		Serial1.println("Radio initialization failed on Core 0, going to sleep");
+		goToSleep();
+	}
+    Serial1.println("Radio initialized successfully on Core 0");
 
-    // Register callbacks
-    radio.onRxComplete(onDataReceived);
-    radio.onTxComplete(onTxComplete);
-    radio.onError(onRadioError);
+    // Register callbacks (will be fired from backgroundTasks via loop())
+    resonantRadio.onRxComplete(onDataReceived);
+    resonantRadio.onTxComplete(onTxComplete);
+    resonantRadio.onError(onRadioError);
     Serial1.println("Callbacks registered");
 
     // Print configuration
-    RadioConfig currentConfig = radio.getConfig();
+    RadioConfig currentConfig = resonantRadio.getConfig();
     Serial1.printf("Frequency: %.1f MHz\n", (double)(currentConfig.frequency / 1000000.0));
     if (currentConfig.modem == MODEM_LORA_MODE) {
         Serial1.printf("Mode: LoRa SF%d BW%d\n", 
@@ -86,14 +53,14 @@ void setup()
     txStartTime = millis();
     preTxTime = millis();
 
-    // Run demo
+    // Run demo - send() queues the request, Core 0 executes it
     if (multiPacketDemo) {
         Serial1.println("\n--- Multi-Packet Demo ---");
         Serial1.printf("Sending %d bytes of data...\n", strlen(genesis));
         
         // Set destination to broadcast
         uint8_t broadcastID[4] = {0xFF, 0xFF, 0xFF, 0xFF};
-        radio.send((uint8_t*)genesis, strlen(genesis), broadcastID, false);
+        resonantRadio.send((uint8_t*)genesis, strlen(genesis), broadcastID, false);
     } else {
         Serial1.println("\n--- Single-Packet Demo ---");
         
@@ -109,23 +76,20 @@ void setup()
             data, 200, destinationID, metricsAckRequired ? 1 : 0);
         
         Serial1.printf("Transmitting telemetry frame: %zu bytes\n", telemetryFrame.size);
-        radio.send(telemetryFrame.frame, telemetryFrame.size);
+        resonantRadio.send(telemetryFrame.frame, telemetryFrame.size);
         
         // Free frame memory
         delete[] telemetryFrame.frame;
     }
 
-    Serial1.println("Transmission started...");
+    Serial1.println("Transmission request queued...");
 }
 
 // ============================================================================
-// Loop - Process radio IRQs here
+// Loop (runs on Core 1 - radio handling is on Core 0)
 // ============================================================================
 void loop()
-{
-    // Process radio IRQs - must be called frequently!
-    radio.loop();
-    
+{    
     // Check for wake timeout (single packet mode only)
     if (millis() > wakeTimeout && !multiPacketDemo) {
         Serial1.println("Wake timeout reached");
@@ -133,7 +97,7 @@ void loop()
     }
 
     // Check if we should sleep
-    if (shouldSleep && radio.isTransmissionComplete()) {
+    if (shouldSleep && resonantRadio.isTransmissionComplete()) {
         goToSleep();
     }
 }
@@ -190,7 +154,7 @@ void onTxComplete(bool success, size_t bytesSent, uint8_t packetCount)
 
     if (metricsAckRequired && success) {
         Serial1.println("Waiting for ACK...");
-        radio.startRx(3000);  // 3 second timeout
+        resonantRadio.startRx(3000);  // 3 second timeout
     } else {
         shouldSleep = true;
     }
@@ -243,7 +207,7 @@ void goToSleep(void)
     Serial1.println("************************************\n");
     
     // Put radio to deep sleep
-    radio.deepSleep();
+    resonantRadio.deepSleep();
     
     // Configure timer wakeup
     esp_sleep_enable_timer_wakeup(SLEEP_SECONDS * uS_TO_S_FACTOR);
@@ -252,4 +216,39 @@ void goToSleep(void)
     Serial1.println("Entering deep sleep...");
     Serial1.flush();
     esp_deep_sleep_start();
+}
+
+// ============================================================================
+// Background Tasks (runs on Core 0 - handles ALL radio operations)
+// ============================================================================
+void backgroundTasks(void *arg)
+{
+    Serial1.println("Radio task started on Core 0");
+    
+    // Initialize radio ON CORE 0 - this is critical for thread safety
+    RadioConfig config;
+    if (multiPacketDemo) {
+        // Use FSK for bulk transfer (faster for large data)
+        config = ResonantLRRadio::getFskBulkPreset();
+        Serial1.println("Using FSK Bulk Transfer preset");
+    } else {
+        // Use LoRa for telemetry (better range for small packets)
+        config = ResonantLRRadio::getLoRaTelemetryPreset();
+        Serial1.println("Using LoRa Telemetry preset");
+    }
+
+    if (!resonantRadio.init(&resonantFrame, config)) {
+        Serial1.println("ERROR: Radio initialization failed on Core 0!");
+        // radioInitialized stays false, setup() will hang
+        vTaskDelete(NULL);
+        return;
+    }
+    
+    Serial1.println("Radio init complete, starting main radio loop");
+    
+    // Main radio loop - processes requests, IRQs, and fires callbacks
+    while(true) {
+        resonantRadio.loop();  // Processes requests + IRQs + fires callbacks
+        vTaskDelay(1); // 1ms delay for responsive radio handling
+    }
 }
