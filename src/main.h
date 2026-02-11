@@ -3,48 +3,41 @@
 
 #include <Arduino.h>
 #include <SPI.h>
-#include <esp_sleep.h>
 #include "resonant_lr_radio.h"
 #include "resonant_frame.h"
+#include "resonant_power_manager.h"
+#include "resonant_storage.h"
 
-// ============================================================================
-// Configuration
-// ============================================================================
-#define SLEEP_SECONDS 5
-#define uS_TO_S_FACTOR 1000000
+enum class TxContext {
+    NONE,
+    TELEMETRY,
+    METRICS,
+    COMMAND_RESPONSE,
+    ACK
+};
+
+volatile TxContext currentTxContext = TxContext::NONE;
+
+constexpr uint8_t FIRMWARE_VERSION = 1;
+constexpr uint8_t HARDWARE_VERSION = 1;
+constexpr uint8_t SENSOR_TYPE = 0x01;
 
 // ============================================================================
 // Global Instances
 // ============================================================================
 inline ResonantLRRadio resonantRadio;
 inline ResonantFrame resonantFrame;
+inline ResonantPowerManager powerManager;
+inline ResonantStorage storage;
 
 // ============================================================================
 // Application State
 // ============================================================================
-inline volatile bool shouldSleep = false;
 inline volatile bool transmissionComplete = false;
 
-inline bool metricsAckRequired = false;
+inline bool telemetryAckRequired = false;
 inline bool multiPacketDemo = true;
-
-// ============================================================================
-// Timing & Energy Tracking
-// ============================================================================
-inline unsigned long wakeTimeout = 5000;
-inline unsigned long preTxTime = 0;
-inline unsigned long txStartTime = 0;
-inline unsigned long timeOnAir = 0;
-inline unsigned long ackStartTime = 0;
-inline unsigned long ackTime = 0;
-
-inline float preTxCurrentDraw = 40.7;
-inline float txCurrentDraw = 212.0;
-inline float ackCurrentDraw = 69.3;
-
-// Energy buffer - stored in RTC memory (survives deep sleep)
-// Defined in main.cpp due to RTC_DATA_ATTR
-extern RTC_DATA_ATTR float energyBuffer;
+inline bool firstBoot = true;
 
 // ============================================================================
 // Test Data (Genesis text for multi-packet demo)
@@ -63,10 +56,11 @@ void backgroundTasks(void *arg);
 void onDataReceived(ValidateFrameResult& result, uint8_t* data, size_t dataLength, int16_t rssi, int8_t snr);
 void onTxComplete(bool success, size_t bytesSent, uint8_t packetCount);
 void onRadioError(uint8_t errorCode, const char* message);
+void sendMetricsFrame(void);
 
 // ============================================================================
-// Application Function Declarations
+// Command Processing
 // ============================================================================
-void goToSleep(void);
+void handleCommand(uint8_t commandId, uint8_t* params, size_t paramsLength, uint8_t sourceID[4]);
 
 #endif // MAIN_H
