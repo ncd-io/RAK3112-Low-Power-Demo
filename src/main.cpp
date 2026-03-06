@@ -7,6 +7,13 @@ void setup()
 {
     Serial1.begin(115200, SERIAL_8N1, PIN_SERIAL1_RX, PIN_SERIAL1_TX);
 
+    DynamicJsonDocument doc(1024);
+    uint64_t bigTest = 0xFF34567890ABCDEF;
+    uint32_t test = 0xFF345678;
+    doc["bit_int"] = test;
+    doc["real_big_int"] = bigTest;
+    serializeJson(doc, Serial1);
+    Serial1.println();
 
     // Configure power manager// Configure power manager
     powerManager.setSleepDuration(5);
@@ -74,39 +81,38 @@ void setup()
         Serial1.printf("Mode: FSK %d bps\n", currentConfig.fskDatarate);
     }
 
-    // Run demo - send() queues the request, Core 0 executes it
-    // Note: TX timing is now handled by ResonantLRRadio when it actually starts transmitting
-    if (multiPacketDemo) {
-        Serial1.println("\n--- Multi-Packet Demo ---");
-        Serial1.printf("Sending %d bytes of data...\n", strlen(genesis));
-        
-        // Set destination to broadcast
-        uint8_t broadcastID[4] = {0xFF, 0xFF, 0xFF, 0xFF};
-        currentTxContext = TxContext::TELEMETRY;
-        resonantRadio.send((uint8_t*)genesis, strlen(genesis), broadcastID, telemetryAckRequired);
+    // Adoption-aware startup: check if device has a parent modem
+    if (!storage.isAdopted()) {
+        Serial1.println("\n--- Device NOT adopted - sending adoption advertise ---");
+        sendAdoptionAdvertise();
     } else {
-        Serial1.println("\n--- Single-Packet Demo ---");
+        uint8_t parentId[4];
+        storage.getParentId(parentId);
+        Serial1.printf("\n--- Device adopted by %02X:%02X:%02X:%02X ---\n",
+            parentId[0], parentId[1], parentId[2], parentId[3]);
         
-        // Create test data
-        uint8_t data[200];
-        for (int i = 0; i < 200; i++) {
-            data[i] = (uint8_t)i;
+        if (multiPacketDemo) {
+            Serial1.println("--- Multi-Packet Telemetry ---");
+            Serial1.printf("Sending %d bytes of data...\n", strlen(genesis));
+            currentTxContext = TxContext::TELEMETRY;
+            resonantRadio.send((uint8_t*)genesis, strlen(genesis), parentId, telemetryAckRequired);
+        } else {
+            Serial1.println("--- Single-Packet Telemetry ---");
+            uint8_t data[200];
+            for (int i = 0; i < 200; i++) {
+                data[i] = (uint8_t)i;
+            }
+            
+            FrameData telemetryFrame = resonantFrame.buildTelemetryFrame(
+                data, 200, parentId, telemetryAckRequired ? 1 : 0);
+            
+            Serial1.printf("Transmitting telemetry frame: %zu bytes\n", telemetryFrame.size);
+            currentTxContext = TxContext::TELEMETRY;
+            resonantRadio.send(telemetryFrame.frame, telemetryFrame.size);
+            delete[] telemetryFrame.frame;
         }
-        
-        // Build telemetry frame
-        uint8_t destinationID[4] = {0xFF, 0xFF, 0xFF, 0xFF};
-        FrameData telemetryFrame = resonantFrame.buildTelemetryFrame(
-            data, 200, destinationID, telemetryAckRequired ? 1 : 0);
-        
-        Serial1.printf("Transmitting telemetry frame: %zu bytes\n", telemetryFrame.size);
-        currentTxContext = TxContext::TELEMETRY;
-        resonantRadio.send(telemetryFrame.frame, telemetryFrame.size);
-        
-        // Free frame memory
-        delete[] telemetryFrame.frame;
+        Serial1.println("Transmission request queued...");
     }
-
-    Serial1.println("Transmission request queued...");
 }
 
 // ============================================================================
@@ -190,6 +196,7 @@ void onDataReceived(ValidateFrameResult& result, uint8_t* data, size_t dataLengt
     
     if (result.frameType == resonantFrame.acknowledgementFrameType) {
         Serial1.println("ACK received!");
+        storage.resetAckFailCount();
         powerManager.markRxComplete();
         if(firstBoot) {
             Serial1.println("First boot - sending metrics frame...");
@@ -206,9 +213,24 @@ void onDataReceived(ValidateFrameResult& result, uint8_t* data, size_t dataLengt
         } else {
             Serial1.println("Error: Command frame has no data");
         }
+    } else if (result.frameType == resonantFrame.adoptionRequestFrameType) {
+        Serial1.println("Adoption request received!");
+        Serial1.printf("Modem ID: %02X:%02X:%02X:%02X\n",
+            result.sourceID[0], result.sourceID[1], result.sourceID[2], result.sourceID[3]);
+        
+        storage.setParentId(result.sourceID);
+        Serial1.println("Parent ID stored");
+        
+        if (dataLength > 0 && data != nullptr) {
+            Serial1.printf("Network config received: %zu bytes\n", dataLength);
+            // TODO: parse and apply network config from adoption request payload
+        }
+        
+        powerManager.markRxComplete();
+        delay(150);
+        sendAdoptionAccept(result.sourceID);
     } else if (result.frameType == resonantFrame.multiPacketFrameType) {
         Serial1.println("Multi-packet data received (fully reassembled)");
-        // Data is already reassembled - process it
         Serial1.printf("Total packets: %d\n", result.totalPackets);
     } else {
         Serial1.println("Other frame type received");
@@ -268,11 +290,18 @@ void onTxComplete(bool success, size_t bytesSent, uint8_t packetCount)
             powerManager.requestSleep();
             break;
         case TxContext::ACK:
-            //We just transmitted an ACK so we go to sleep
+            powerManager.requestSleep();
+            break;
+        case TxContext::ADOPTION_ADVERTISE:
+            Serial1.println("Adoption advertise sent, listening for adoption request...");
+            powerManager.markRxStart();
+            resonantRadio.startRx(storage.getWaitAfterTx());
+            break;
+        case TxContext::ADOPTION_ACCEPT:
+            Serial1.println("Adoption accept sent, going to sleep");
             powerManager.requestSleep();
             break;
         default:
-            //Go to sleep
             powerManager.requestSleep();
             break;
     }
@@ -287,8 +316,18 @@ void onRadioError(uint8_t errorCode, const char* message)
     
     switch (errorCode) {
         case RADIO_ERROR_TX_TIMEOUT:
+            powerManager.markRxComplete();
+            powerManager.requestSleep();
+            break;
         case RADIO_ERROR_RX_TIMEOUT:
             powerManager.markRxComplete();
+            if (currentTxContext == TxContext::TELEMETRY && storage.isAdopted()) {
+                storage.incrementAckFailCount();
+                if (storage.isConnectionLost()) {
+                    Serial1.println("Connection lost - clearing parent, will re-adopt next wake");
+                    storage.clearParentId();
+                }
+            }
             powerManager.requestSleep();
             break;
         case RADIO_ERROR_RX_ACCUMULATION_TIMEOUT:
@@ -307,16 +346,8 @@ void backgroundTasks(void *arg)
     Serial1.println("Radio task started on Core 0");
     
     // Initialize radio ON CORE 0 - this is critical for thread safety
-    RadioConfig config;
-    if (multiPacketDemo) {
-        // Use FSK for bulk transfer (faster for large data)
-        config = ResonantLRRadio::getFskBulkPreset();
-        Serial1.println("Using FSK Bulk Transfer preset");
-    } else {
-        // Use LoRa for telemetry (better range for small packets)
-        config = ResonantLRRadio::getLoRaTelemetryPreset();
-        Serial1.println("Using LoRa Telemetry preset");
-    }
+    RadioConfig config = ResonantLRRadio::getLoRaLongRangePreset();
+    Serial1.println("Using LoRa Long Range preset (SF7/BW125)");
 
     if (!resonantRadio.init(&resonantFrame, config)) {
         Serial1.println("ERROR: Radio initialization failed on Core 0!");
@@ -372,4 +403,24 @@ void sendMetricsFrame(void)
     currentTxContext = TxContext::METRICS;
     resonantRadio.send(metricsFrame.frame, metricsFrame.size);
     delete[] metricsFrame.frame;
+}
+
+void sendAdoptionAdvertise(void)
+{
+    Serial1.println("Sending adoption advertise frame...");
+    FrameData frame = resonantFrame.buildAdoptionAdvertiseFrame(
+        SENSOR_TYPE, HARDWARE_VERSION, FIRMWARE_VERSION);
+    currentTxContext = TxContext::ADOPTION_ADVERTISE;
+    resonantRadio.send(frame.frame, frame.size);
+    delete[] frame.frame;
+}
+
+void sendAdoptionAccept(uint8_t destinationID[4])
+{
+    Serial1.printf("Sending adoption accept to %02X:%02X:%02X:%02X\n",
+        destinationID[0], destinationID[1], destinationID[2], destinationID[3]);
+    FrameData frame = resonantFrame.buildAdoptionAcceptFrame(destinationID, 0);
+    currentTxContext = TxContext::ADOPTION_ACCEPT;
+    resonantRadio.send(frame.frame, frame.size);
+    delete[] frame.frame;
 }

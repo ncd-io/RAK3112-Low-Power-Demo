@@ -7,13 +7,16 @@
 #include "resonant_frame.h"
 #include "resonant_power_manager.h"
 #include "resonant_storage.h"
+#include "ArduinoJson.h"
 
 enum class TxContext {
     NONE,
     TELEMETRY,
     METRICS,
     COMMAND_RESPONSE,
-    ACK
+    ACK,
+    ADOPTION_ADVERTISE,
+    ADOPTION_ACCEPT
 };
 
 volatile TxContext currentTxContext = TxContext::NONE;
@@ -57,6 +60,8 @@ void onDataReceived(ValidateFrameResult& result, uint8_t* data, size_t dataLengt
 void onTxComplete(bool success, size_t bytesSent, uint8_t packetCount);
 void onRadioError(uint8_t errorCode, const char* message);
 void sendMetricsFrame(void);
+void sendAdoptionAdvertise(void);
+void sendAdoptionAccept(uint8_t destinationID[4]);
 
 // ============================================================================
 // Command Processing
