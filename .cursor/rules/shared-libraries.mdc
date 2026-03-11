@@ -1,0 +1,47 @@
+---
+description: Shared library conventions for Resonant IoT sensor platform
+globs: shared_libs/**
+alwaysApply: false
+---
+
+# Resonant Shared Libraries
+
+These libraries are used by both device and modem firmware via `lib_extra_dirs = ../shared_libs`.
+
+## RESONANT_LR_RADIO
+- SX1262 LoRa radio abstraction with dual-core safety
+- Core 0 executes all radio operations; Core 1 sets request flags
+- Handles single-packet and multi-packet TX/RX with automatic fragmentation
+- Callbacks: onRxComplete, onTxComplete, onError
+- Board-specific pin configs via `#ifdef BOARD_RAK3112` / default Heltec V3
+- Config presets: getLoRaLongRangePreset(), getLoRaTelemetryPreset(), getFskBulkPreset()
+
+## RESONANT_FRAME
+- Wire Protocol v1 frame builder and validator
+- 20-byte overhead: header(1) + length(2) + srcId(4) + dstId(4) + type(1) + options(1) + seqNum(4) + totalPkts(1) + pktIdx(1) + data(N) + checksum(1)
+- Frame types: 0x01-0x0B (telemetry, metrics, commands, adoption, etc.)
+- Source ID derived from ESP32 MAC address (last 4 bytes)
+
+## RESONANT_ENCRYPTION
+- ATECC608B abstraction with mbedTLS mock mode (ATECC_MOCK=1)
+- ECDH (P-256), ECDSA sign/verify, AES-128-GCM encrypt/decrypt
+- HKDF key derivation: salt="ResonantLR", info=version+sensorId+gatewayId
+- X.509 certificate handling: load CA, verify chain, extract pubkey
+- Device credential provisioning: loadDeviceCredentials()
+
+## RESONANT_STORAGE
+- NVS (Preferences) wrapper for persistent state
+- Adoption state: parentId, ackFailCount, waitAfterTx
+- Energy tracking, boot count, metrics timing
+- StorageKeys namespace for all key constants
+
+## RESONANT_POWER_MANAGER
+- Deep sleep management with configurable duration
+- Energy metering: pre-TX, TX, RX current draw profiles
+- Wake timeout enforcement
+- RTC memory energy buffer (survives deep sleep)
+
+## Cross-cutting rules
+- Changes to shared_libs affect both device and modem — test both after changes
+- Radio library changes require testing on both RAK3112 and Heltec V3 pin configs
+- Frame format changes must be synchronized with Python test scripts

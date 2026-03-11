@@ -7,6 +7,9 @@
 #include "resonant_frame.h"
 #include "resonant_power_manager.h"
 #include "resonant_storage.h"
+#include "resonant_encryption.h"
+#include "certs/resonant_ca_cert.h"
+#include "certs/device_credentials.h"
 #include "ArduinoJson.h"
 
 enum class TxContext {
@@ -25,6 +28,10 @@ constexpr uint8_t FIRMWARE_VERSION = 1;
 constexpr uint8_t HARDWARE_VERSION = 1;
 constexpr uint8_t SENSOR_TYPE = 0x01;
 
+// GCM adds 12-byte IV + 16-byte tag to every encrypted payload
+constexpr size_t ENCRYPTION_OVERHEAD = ResonantEncryption::GCM_IV_SIZE
+                                     + ResonantEncryption::GCM_TAG_SIZE;
+
 // ============================================================================
 // Global Instances
 // ============================================================================
@@ -32,6 +39,7 @@ inline ResonantLRRadio resonantRadio;
 inline ResonantFrame resonantFrame;
 inline ResonantPowerManager powerManager;
 inline ResonantStorage storage;
+inline ResonantEncryption encryption;
 
 // ============================================================================
 // Application State
@@ -41,6 +49,8 @@ inline volatile bool transmissionComplete = false;
 inline bool telemetryAckRequired = false;
 inline bool multiPacketDemo = true;
 inline bool firstBoot = true;
+inline uint32_t txSequenceNumber = 1;
+inline uint32_t rxLastSequenceNumber = 0;
 
 // ============================================================================
 // Test Data (Genesis text for multi-packet demo)
@@ -62,10 +72,23 @@ void onRadioError(uint8_t errorCode, const char* message);
 void sendMetricsFrame(void);
 void sendAdoptionAdvertise(void);
 void sendAdoptionAccept(uint8_t destinationID[4]);
+void sendAdoptionAcceptCrypto(uint8_t destinationID[4], const uint8_t* challengeNonce);
 
 // ============================================================================
 // Command Processing
 // ============================================================================
 void handleCommand(uint8_t commandId, uint8_t* params, size_t paramsLength, uint8_t sourceID[4]);
+
+// ============================================================================
+// Encryption Helpers
+// ============================================================================
+void getDeviceSensorId(uint8_t* sensorId);
+void buildAAD(uint8_t* aad, uint8_t frameType, const uint8_t* id, uint32_t seqNum);
+bool encryptPayload(const uint8_t* plaintext, size_t plaintextLen,
+                    uint8_t frameType, uint8_t** outPayload, size_t* outLen);
+bool decryptPayload(const uint8_t* encPayload, size_t encPayloadLen,
+                    uint8_t frameType, const uint8_t* senderId,
+                    uint32_t sequenceNumber,
+                    uint8_t* plaintext, size_t* plaintextLen);
 
 #endif // MAIN_H

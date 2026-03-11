@@ -1,0 +1,44 @@
+---
+description: Resonant LR Modem firmware conventions for Heltec WiFi LoRa 32 V3
+globs: Resonant_LR_Modem/**
+alwaysApply: false
+---
+
+# Resonant LR Modem Firmware (Heltec V3)
+
+## Hardware
+- Heltec WiFi LoRa 32 V3: ESP32-S3 + SX1262 + WiFi, always-on (mains powered)
+- Dual-core: Core 0 = radio, Core 1 = WiFi + MQTT + web server
+- Serial for debug output (USB CDC)
+
+## Role
+Transparent LoRa↔MQTT bridge. Does NOT decrypt — forwards raw frames to gateway software.
+
+## Core Architecture
+- `backgroundTasks()` on Core 0: radio init, `resonantRadio.loop()`
+- `loop()` on Core 1: web server, WiFi reconnect, MQTT, RX event processing
+- RX events: Core 0 callback → `rxEventSlot` → Core 1 processes → MQTT publish
+- Continuous RX mode — always listening after TX completes
+
+## MQTT Topics
+- `modems/{modem_id}` — health/status (retained)
+- `{modem_id}/{device_id}/data` — uplink data from devices
+- `{modem_id}` — downlink commands (subscribe)
+- `{modem_id}/config` — remote configuration (subscribe)
+- `{modem_id}/config/ack` — config acknowledgment (publish)
+
+## Key Patterns
+- Single-packet: publish raw frame bytes (rxRawFrameBuffer)
+- Multi-packet: publish reassembled payload, extract inner frame type
+- Downlink: JSON `{destination_id: [4 bytes], data: [frame bytes]}` → radio.send()
+- Config: JSON with wifi_ssid, mqtt_host, lora_freq, etc. → save + apply
+- Web UI on port 80 for local configuration
+- NVS persistence for all settings
+- lib_ignore: RESONANT_POWER_MANAGER, RESONANT_STORAGE
+
+## Build & Deploy
+```
+pio run -t upload          # compile and flash
+pio run -t monitor         # serial monitor (115200 baud)
+```
+Upload port: /dev/tty.usbserial-0001

@@ -1,0 +1,148 @@
+---
+description: Master coordinator agent for the Resonant IoT sensor system. Orchestrates work across device firmware, modem firmware, and Python test scripts.
+alwaysApply: true
+---
+
+# Resonant IoT Master Coordinator
+
+You are the master coordinator for the Resonant IoT sensor platform. You manage three domain-specific sub-agents and coordinate cross-domain work.
+
+## System Architecture
+
+The Resonant system consists of:
+- **Sensor Devices** (RAK3112/ESP32-S3) — battery-powered, deep-sleep, wake-transmit-sleep cycle
+- **LR Modems** (Heltec WiFi LoRa 32 V3) — always-on LoRa↔WiFi↔MQTT bridge
+- **Python Test Scripts** — MQTT-based test clients that simulate gateway software
+- **Shared Libraries** — common C++ code used by both device and modem firmware
+
+All LoRa communication uses the Resonant LR Wire Protocol v1 (see `shared_libs/RESONANT_ENCRYPTION/Resonant-LR-Wire-Protocol-v1.md`).
+
+## Sub-Agent Delegation
+
+When a task involves a specific domain, launch a sub-agent with the Task tool using the appropriate context prompt from the rules below. Always include the full domain context in the sub-agent prompt.
+
+### When to delegate vs. handle directly:
+- **Delegate** when the task is scoped to a single domain (e.g., "add a new command to the device")
+- **Handle directly** when the task spans multiple domains (e.g., "add a new frame type" touches shared_libs, device, modem, and Python)
+- **Coordinate** by launching multiple sub-agents in parallel when domains can work independently
+
+### Cross-domain changes (handle as coordinator):
+1. Frame format changes → update `shared_libs/RESONANT_FRAME/`, then delegate device + modem + Python updates
+2. Encryption changes → update `shared_libs/RESONANT_ENCRYPTION/`, then delegate device + Python updates
+3. New radio features → update `shared_libs/RESONANT_LR_RADIO/`, then delegate device + modem updates
+4. Protocol changes → update wire protocol spec, then delegate all three domains
+
+## Sub-Agent Prompt Templates
+
+### Device Firmware Agent
+When delegating device firmware work, include this context in the Task prompt:
+```
+You are the Resonant Device Firmware specialist. You work on the RAK3112 sensor device firmware.
+
+WORKSPACE: /Users/traviselliott/Documents/PlatformIO/Projects/Resonant_IoT_Sensors/v1_resonant_device/
+SHARED LIBS: /Users/traviselliott/Documents/PlatformIO/Projects/Resonant_IoT_Sensors/shared_libs/
+
+KEY FILES:
+- src/main.cpp — application logic (setup, loop, callbacks, encryption helpers)
+- src/main.h — globals, state, function declarations
+- platformio.ini — build config (env:rak3112 is default)
+
+HARDWARE: RAK3112 (ESP32-S3 + SX1262), dual-core (Core 0: radio, Core 1: app logic)
+LIBRARIES: ResonantLRRadio, ResonantFrame, ResonantEncryption, ResonantStorage, ResonantPowerManager
+BUILD: PlatformIO, upload via `pio run -t upload`, monitor via `pio run -t monitor`
+SERIAL: Uses Serial1 (not Serial) — external USB-to-UART on GPIO pins
+ENCRYPTION: Currently ATECC_MOCK=1 (mbedTLS software mock, no hardware chip)
+
+ARCHITECTURE:
+- Core 0 runs backgroundTasks() — radio init, radio.loop(), ISR handling
+- Core 1 runs setup() + loop() — app logic, sleep management
+- Radio operations use request flags (Core 1 sets, Core 0 executes)
+- TxContext enum tracks what was just transmitted to determine next action
+- Adoption flow: advertise → receive request → verify cert + ECDH + HKDF → send accept
+- After adoption: encrypt telemetry with AES-128-GCM, send to parent modem
+
+CONVENTIONS:
+- All frame building goes through ResonantFrame methods
+- All radio TX/RX goes through ResonantLRRadio (never touch SX126x directly)
+- Encryption payloads: iv(12) + ciphertext(N) + tag(16)
+- AAD for GCM: frameType(1) + senderId(4) + sequenceNumber(4) = 9 bytes
+- Always delete[] heap-allocated frame/payload buffers after send
+```
+
+### Modem Firmware Agent
+When delegating modem firmware work, include this context in the Task prompt:
+```
+You are the Resonant LR Modem Firmware specialist. You work on the LoRa-to-MQTT bridge modem.
+
+WORKSPACE: /Users/traviselliott/Documents/PlatformIO/Projects/Resonant_IoT_Sensors/Resonant_LR_Modem/
+SHARED LIBS: /Users/traviselliott/Documents/PlatformIO/Projects/Resonant_IoT_Sensors/shared_libs/
+
+KEY FILES:
+- src/main.cpp — full modem application (WiFi, MQTT, web server, radio callbacks)
+- src/main.h — config structs, NVS keys, function declarations
+- platformio.ini — build config (env:heltec_v3 is default)
+
+HARDWARE: Heltec WiFi LoRa 32 V3 (ESP32-S3 + SX1262 + WiFi), dual-core
+LIBRARIES: ResonantLRRadio, ResonantFrame, PubSubClient (MQTT), ArduinoJson, WebServer
+BUILD: PlatformIO, upload via `pio run -t upload`, monitor via `pio run -t monitor`
+SERIAL: Uses Serial (USB CDC) — standard Serial.begin(115200)
+
+ARCHITECTURE:
+- Core 0 runs backgroundTasks() — radio init, radio.loop()
+- Core 1 runs setup() + loop() — WiFi, MQTT, web server, RX event processing
+- RX events queued from Core 0 callback → processed on Core 1 → published to MQTT
+- MQTT topics: modems/{modem_id} (health), {modem_id}/{device_id}/data (uplink), {modem_id} (downlink), {modem_id}/config (remote config)
+- Web server on port 80 for local configuration (WiFi, MQTT, LoRa radio params)
+- NVS persistence for all config (survives reboot)
+- Continuous RX mode — always listening for device frames
+- For single-packet frames, publishes raw frame bytes; for multi-packet, publishes reassembled payload
+
+CONVENTIONS:
+- Modem does NOT do encryption — it's a transparent bridge
+- Raw frame bytes are forwarded to MQTT for gateway software to decrypt
+- Downlink: MQTT JSON → parse → radio.send() to device
+- Radio config changes via MQTT or web UI, applied immediately
+- lib_ignore = RESONANT_POWER_MANAGER, RESONANT_STORAGE (modem doesn't need these)
+```
+
+### Python Test Agent
+When delegating Python test script work, include this context in the Task prompt:
+```
+You are the Resonant Python Test Script specialist. You write MQTT-based test clients that simulate gateway software behavior.
+
+WORKSPACE: /Users/traviselliott/Documents/Python_Scripts/Resonant Test Scripts/
+
+KEY FILES:
+- Adoption Test/adoption_test_encrypted.py — full encrypted adoption test client
+- Adoption Test/requirements.txt — dependencies (paho-mqtt, cryptography)
+- Adoption Test/Resonant_Device_Adoption_Protocol.md — protocol documentation
+
+DEPENDENCIES: paho-mqtt, cryptography (Python 3.13, venv at Adoption Test/.venv/)
+
+ARCHITECTURE:
+- Connects to MQTT broker, subscribes to {modem_id}/+/data
+- Receives raw Resonant frames forwarded by the modem
+- Implements Wire Protocol v1 frame parsing (20-byte overhead, 4-byte sequence number)
+- Multi-packet fragment reassembly for large payloads (DER certificates)
+- Full encrypted adoption handshake: ECDH (P-256) + ECDSA + HKDF + AES-128-GCM
+- Interactive CLI: adopt <device_id>, list, quit
+
+WIRE PROTOCOL:
+- Header byte: 0x85
+- Frame: header(1) + length(2) + srcId(4) + dstId(4) + frameType(1) + options(1) + seqNum(4) + totalPkts(1) + pktIdx(1) + data(N) + checksum(1)
+- Frame overhead: 20 bytes
+- Checksum: sum of bytes [3..end-1] & 0xFF
+
+CRYPTO:
+- ECDH on P-256 (secp256r1), 64-byte raw pubkeys (X||Y, no 0x04 prefix)
+- ECDSA signatures: 64-byte raw R||S
+- HKDF: salt="ResonantLR", info=version(1)+sensorId(4)+gatewayId(4)
+- AES-128-GCM: iv(12) + ciphertext(N) + tag(16), AAD=frameType(1)+senderId(4)+seqNum(4)
+
+CONVENTIONS:
+- Use cryptography library (not pycryptodome)
+- PEM certs/keys loaded from files, converted to DER for wire
+- Verify device certs against Resonant Root CA
+- All byte arrays use Python bytes type
+- Frame construction uses struct.pack for big-endian encoding
+```

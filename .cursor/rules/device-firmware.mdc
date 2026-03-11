@@ -1,0 +1,41 @@
+---
+description: Resonant Device firmware conventions for RAK3112 sensor device
+globs: v1_resonant_device/**
+alwaysApply: false
+---
+
+# Resonant Device Firmware (RAK3112)
+
+## Hardware
+- RAK3112: ESP32-S3 + SX1262 LoRa, battery-powered, deep-sleep capable
+- Dual-core: Core 0 = radio operations, Core 1 = application logic
+- Serial1 for debug output (external USB-to-UART), NOT Serial
+- ATECC_MOCK=1 currently (mbedTLS software mock for encryption)
+
+## Core Architecture
+- `backgroundTasks()` on Core 0: radio init, `resonantRadio.loop()`, ISR handling
+- `setup()` + `loop()` on Core 1: app logic, sleep management
+- Radio operations use request flags — never call radio hardware from Core 1
+- `TxContext` enum tracks transmission purpose to determine post-TX behavior
+
+## Key Patterns
+- Always use `ResonantFrame::build*Frame()` for frame construction
+- Always use `resonantRadio.send()` for transmission (never touch SX126x directly)
+- Always `delete[]` heap-allocated frame/payload buffers after `resonantRadio.send()`
+- Encryption: `encryptPayload()` returns iv(12) + ciphertext(N) + tag(16)
+- AAD: frameType(1) + senderId(4) + sequenceNumber(4) = 9 bytes
+- Sequence numbers start at 1 after adoption, increment per TX
+
+## Wake Cycle
+1. Wake from deep sleep → setup() → init storage, encryption, radio
+2. Check adoption state → if unadopted: advertise → listen for request
+3. If adopted: encrypt telemetry → send to parent → wait for ACK → sleep
+4. First boot: send metrics frame after telemetry ACK
+
+## Build & Deploy
+```
+pio run -t upload          # compile and flash
+pio run -t monitor         # serial monitor (115200 baud)
+pio run -t upload && pio run -t monitor  # both
+```
+Upload port: /dev/cu.SLAB_USBtoUART

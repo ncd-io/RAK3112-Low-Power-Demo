@@ -1,0 +1,36 @@
+---
+description: Resonant Python test script conventions for MQTT-based test clients
+globs: Resonant Test Scripts/**
+alwaysApply: false
+---
+
+# Resonant Python Test Scripts
+
+## Purpose
+MQTT-based test clients that simulate gateway software to test device firmware behavior.
+
+## Environment
+- Python 3.13, venv at `Adoption Test/.venv/`
+- Dependencies: paho-mqtt, cryptography
+- Run: `python adoption_test_encrypted.py --modem-id <id> --broker <host> --cert <pem> --key <pem> --ca <pem>`
+
+## Wire Protocol v1
+- Header: 0x85, frame overhead: 20 bytes
+- Frame: header(1) + length(2) + srcId(4) + dstId(4) + frameType(1) + options(1) + seqNum(4) + totalPkts(1) + pktIdx(1) + data(N) + checksum(1)
+- Checksum: `sum(frame[3:-1]) & 0xFF`
+- Options: `(version << 5) | (ack & 0x01)`, version=1
+
+## Crypto Conventions
+- Use `cryptography` library (not pycryptodome)
+- ECDH: P-256, 64-byte raw pubkeys (strip 0x04 prefix from X962 uncompressed)
+- ECDSA: 64-byte raw R||S signatures (convert to/from DER for library calls)
+- HKDF: salt=b"ResonantLR", info=version(1)+sensorId(4)+gatewayId(4), output=16 bytes
+- AES-128-GCM: iv(12) + ciphertext + tag(16), AAD=frameType(1)+senderId(4)+seqNum(4)
+- PEM files → DER for wire transmission
+
+## Key Patterns
+- Subscribe to `{modem_id}/+/data` for all device uplinks
+- Publish to `{modem_id}` topic for downlink commands
+- Frame bytes sent as JSON array: `{"destination_id": [4 ints], "data": [frame bytes]}`
+- Use `struct.pack(">H", value)` for big-endian encoding
+- Interactive CLI with threading for concurrent MQTT + user input
