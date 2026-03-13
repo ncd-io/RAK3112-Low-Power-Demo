@@ -150,13 +150,23 @@ void setup()
                                &encPayload, &encLen)) {
                 Serial1.printf("Sending %zu encrypted bytes (%d plaintext)\n",
                                encLen, strlen(genesis));
+                uint8_t opts = ResonantFrame::buildOptionsV1(telemetryAckRequired);
+                FrameData telemetryFrame = resonantFrame.buildTelemetryFrame(
+                    encPayload, encLen, parentId, opts, txSequenceNumber);
+                txSequenceNumber++;
                 currentTxContext = TxContext::TELEMETRY;
-                resonantRadio.send(encPayload, encLen, parentId, telemetryAckRequired);
+                resonantRadio.send(telemetryFrame.frame, telemetryFrame.size, parentId, telemetryAckRequired);
+                delete[] telemetryFrame.frame;
                 delete[] encPayload;
             } else {
                 Serial1.println("Encryption failed, sending plaintext fallback");
+                uint8_t opts = ResonantFrame::buildOptionsV1(telemetryAckRequired);
+                FrameData telemetryFrame = resonantFrame.buildTelemetryFrame(
+                    (uint8_t*)genesis, strlen(genesis), parentId, opts, txSequenceNumber);
+                txSequenceNumber++;
                 currentTxContext = TxContext::TELEMETRY;
-                resonantRadio.send((uint8_t*)genesis, strlen(genesis), parentId, telemetryAckRequired);
+                resonantRadio.send(telemetryFrame.frame, telemetryFrame.size, parentId, telemetryAckRequired);
+                delete[] telemetryFrame.frame;
             }
         } else {
             Serial1.println("--- Single-Packet Encrypted Telemetry ---");
