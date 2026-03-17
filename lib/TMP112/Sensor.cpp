@@ -13,6 +13,11 @@ bool TMP112Sensor::begin(TwoWire& wire, uint8_t addr) {
     return sensorOperational;
 }
 
+void TMP112Sensor::setContactPin(uint8_t pin) {
+    _contactPin = (int8_t)pin;
+    pinMode(pin, INPUT_PULLUP);
+}
+
 void TMP112Sensor::onDataReady(DataReadyCallback cb) {
     _callback = cb;
 }
@@ -28,9 +33,10 @@ void TMP112Sensor::loop() {
     _readingRequested = false;
 
     float tempC = readTemperature();
+    contactClosed = readContact();
 
     if (_callback != nullptr) {
-        _callback(tempC);
+        _callback(tempC, contactClosed);
     }
 }
 
@@ -47,11 +53,17 @@ float TMP112Sensor::readTemperature() {
     uint8_t msb = _wire->read();
     uint8_t lsb = _wire->read();
 
-    // 12-bit value: MSB[7:0] are bits 11-4, LSB[7:4] are bits 3-0
     int16_t raw = (msb << 4) | (lsb >> 4);
     if (raw & 0x800) {
-        raw |= 0xF000;  // sign-extend for negative temperatures
+        raw |= 0xF000;
     }
 
     return raw * 0.0625f;
+}
+
+bool TMP112Sensor::readContact() {
+    if (_contactPin < 0) {
+        return false;
+    }
+    return digitalRead(_contactPin) == LOW;
 }

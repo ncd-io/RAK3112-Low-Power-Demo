@@ -41,9 +41,12 @@ inline TMP112Sensor tempSensor;
 inline volatile bool transmissionComplete = false;
 inline volatile bool sensorDataReady = false;
 inline float lastTemperatureC = 0.0f;
+inline bool lastContactClosed = false;
 
 inline bool telemetryAckRequired = false;
 inline bool firstBoot = true;
+inline bool interruptWake = false;
+inline bool contactWake = false;
 inline uint32_t txSequenceNumber = 1;
 inline uint32_t rxLastSequenceNumber = 0;
 
@@ -59,7 +62,7 @@ void backgroundTasks(void *arg);
 void onDataReceived(ValidateFrameResult& result, uint8_t* data, size_t dataLength, int16_t rssi, int8_t snr);
 void onTxComplete(bool success, size_t bytesSent, uint8_t packetCount);
 void onRadioError(uint8_t errorCode, const char* message);
-void onSensorDataReady(float temperatureC);
+void onSensorDataReady(float temperatureC, bool contactClosed);
 void sendEncryptedTelemetry(const uint8_t* payload, size_t payloadLen, uint8_t parentId[4]);
 void sendMetricsFrame(void);
 

@@ -13,11 +13,14 @@ void setup()
     powerManager.setSleepDuration(5);
     powerManager.setWakeTimeout(5000);
     powerManager.setStorage(&storage);
+    powerManager.setWakeInterruptPin(2, HIGH);
+    powerManager.setContactWakePin(14);
     powerManager.enablePeripheralCircuit();
 
     if (!tempSensor.begin(Wire, 0x48)) {
         bootError = bootError | BootError::SENSOR;
     }
+    tempSensor.setContactPin(14);
     tempSensor.onDataReady(onSensorDataReady);
 
     powerManager.markPreTxStart();
@@ -33,6 +36,13 @@ void setup()
     // Clear adoption on any reset that isn't a deep-sleep wake.
     esp_reset_reason_t resetReason = esp_reset_reason();
     firstBoot = resetReason == ESP_RST_POWERON;
+    interruptWake = powerManager.wasWokenByInterrupt();
+    contactWake = powerManager.wasWokenByContact();
+    if (interruptWake) {
+        LOG_I("*** Woken by user button (ext0/GPIO2) ***");
+    } else if (contactWake) {
+        LOG_I("*** Woken by contact sensor (ext1/GPIO14) ***");
+    }
 
     //Clear adoption on reset for test purposes
     if (resetReason != ESP_RST_DEEPSLEEP && storage.isAdopted()) {
@@ -124,12 +134,14 @@ void loop()
         storage.getParentId(parentId);
 
         int16_t tempCenti = (int16_t)(lastTemperatureC * 100);
-        uint8_t payload[2] = {
+        uint8_t payload[3] = {
             (uint8_t)(tempCenti >> 8),
-            (uint8_t)(tempCenti & 0xFF)
+            (uint8_t)(tempCenti & 0xFF),
+            lastContactClosed ? (uint8_t)0x01 : (uint8_t)0x00
         };
-        LOG_I("Temperature: %.2f C -> sending telemetry", lastTemperatureC);
-        sendEncryptedTelemetry(payload, 2, parentId);
+        LOG_I("Temperature: %.2f C, Contact: %s -> sending telemetry",
+              lastTemperatureC, lastContactClosed ? "CLOSED" : "OPEN");
+        sendEncryptedTelemetry(payload, 3, parentId);
     }
 
     if (powerManager.checkWakeTimeout()) {
@@ -137,8 +149,8 @@ void loop()
     }
 
     if (powerManager.shouldSleep() && resonantRadio.isTransmissionComplete()) {
-        if (firstBoot) {
-            storage.updateLastMetricsTime();
+        if (firstBoot || interruptWake) {
+            storage.updateLastMetricsTime();  
         }
         resonantRadio.deepSleep();
         powerManager.goToSleep();
@@ -219,8 +231,8 @@ void onDataReceived(ValidateFrameResult& result, uint8_t* data, size_t dataLengt
         LOG_I("ACK received!");
         storage.resetAckFailCount();
         powerManager.markRxComplete();
-        if(firstBoot) {
-            LOG_I("First boot - sending metrics frame...");
+        if(firstBoot || interruptWake) {
+            LOG_I("Sending metrics frame...");
             sendMetricsFrame();
         }else{
             powerManager.requestSleep();
@@ -295,8 +307,8 @@ void onTxComplete(bool success, size_t bytesSent, uint8_t packetCount)
                 powerManager.markRxStart();
                 resonantRadio.startRx(3000);
             } else {
-                if (firstBoot) {
-                    LOG_I("First boot - sending metrics frame...");
+                if (firstBoot || interruptWake) {
+                    LOG_I("Sending metrics frame...");
                     sendMetricsFrame();
                 }else{
                     LOG_I("Telemetry ACK not required, going to sleep...");
@@ -388,9 +400,10 @@ void backgroundTasks(void *arg)
 // ============================================================================
 // Callback: Sensor Data Ready
 // ============================================================================
-void onSensorDataReady(float temperatureC)
+void onSensorDataReady(float temperatureC, bool contactClosed)
 {
     lastTemperatureC = temperatureC;
+    lastContactClosed = contactClosed;
     sensorDataReady = true;
 }
 
