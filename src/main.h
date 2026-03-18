@@ -11,6 +11,7 @@
 #include "resonant_log.h"
 #include "adoption_handler.h"
 #include "Sensor.h"
+#include "MB85RS64V.h"
 #include "certs/resonant_ca_cert.h"
 #include "certs/device_credentials.h"
 #include "ArduinoJson.h"
@@ -34,6 +35,8 @@ inline ResonantStorage storage;
 inline ResonantEncryption encryption;
 inline DeviceAdoptionHandler adoptionHandler;
 inline TMP112Sensor tempSensor;
+inline SPIClass framSPI(HSPI);
+inline MB85RS64V fram;
 
 // ============================================================================
 // Application State
@@ -77,14 +80,15 @@ void handleCommand(uint8_t commandId, uint8_t* params, size_t paramsLength, uint
 void getDeviceSensorId(uint8_t* sensorId);
 
 namespace BootError {
-    constexpr uint8_t STORAGE    = (1 << 0);
-    constexpr uint8_t ENCRYPTION = (1 << 1);
-    constexpr uint8_t RADIO      = (1 << 2);
-    constexpr uint8_t ADOPTION   = (1 << 3);
-    constexpr uint8_t METRICS    = (1 << 4);
-    constexpr uint8_t TELEMETRY  = (1 << 5);
-    constexpr uint8_t COMMAND    = (1 << 6);
-    constexpr uint8_t SENSOR     = (1 << 7);
+    constexpr uint16_t STORAGE    = (1 << 0);
+    constexpr uint16_t ENCRYPTION = (1 << 1);
+    constexpr uint16_t RADIO      = (1 << 2);
+    constexpr uint16_t ADOPTION   = (1 << 3);
+    constexpr uint16_t METRICS    = (1 << 4);
+    constexpr uint16_t TELEMETRY  = (1 << 5);
+    constexpr uint16_t COMMAND    = (1 << 6);
+    constexpr uint16_t SENSOR     = (1 << 7);
+    constexpr uint16_t FRAM       = (1 << 8);
 }
 
 #endif // MAIN_H

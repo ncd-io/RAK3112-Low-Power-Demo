@@ -7,7 +7,7 @@ void setup()
 {
     //Initialize Serial1 for debug output
     Serial1.begin(115200, SERIAL_8N1, PIN_SERIAL1_RX, PIN_SERIAL1_TX);
-    uint8_t bootError = 0;
+    uint16_t bootError = 0;
 
     //Set power manager sleep duration and wake timeout
     powerManager.setSleepDuration(5);
@@ -16,6 +16,19 @@ void setup()
     powerManager.setWakeInterruptPin(2, HIGH);
     powerManager.setContactWakePin(14);
     powerManager.enablePeripheralCircuit();
+
+    if (fram.begin(framSPI, 12, 10, 11, 13)) {
+        LOG_I("FRAM MB85RS64V detected");
+        if (fram.selfTest()) {
+            LOG_I("FRAM self-test PASSED");
+        } else {
+            LOG_W("FRAM self-test FAILED");
+            bootError = bootError | BootError::FRAM;
+        }
+    } else {
+        LOG_E("FRAM MB85RS64V not detected");
+        bootError = bootError | BootError::FRAM;
+    }
 
     if (!tempSensor.begin(Wire, 0x48)) {
         bootError = bootError | BootError::SENSOR;
@@ -49,6 +62,9 @@ void setup()
         storage.clearParentId();
     }
 
+    // Start radio init on Core 0 early so it runs in parallel with encryption
+    xTaskCreatePinnedToCore(backgroundTasks, "RadioTask", 20000, NULL, 1, &backgroundTask, 0);
+
     //Initialize encryption Load Private Key and Device Certificate(This will be replaced with the real key and certificate from ATECC608B in the future)
     if (encryption.begin()){
         if (device_key_der_len > 0 && device_cert_der_len > 0) {
@@ -77,10 +93,9 @@ void setup()
         LOG_I("Test session key loaded for unadopted testing");
     }    
 
-    xTaskCreatePinnedToCore(backgroundTasks, "RadioTask", 20000, NULL, 1, &backgroundTask, 0);
-
+    // Wait for radio init on Core 0 (should already be done by now)
     while (!resonantRadio.radioInitialized && !powerManager.checkWakeTimeout()) {
-        delay(10);
+        delay(1);
     }
     if(!resonantRadio.radioInitialized || millis() > powerManager.getWakeTimeout()) {
         LOG_E("Radio initialization failed on Core 0, going to sleep");
@@ -115,7 +130,7 @@ void setup()
         tempSensor.requestReading();
     }
     if(bootError != 0){
-        LOG_E("Boot error: 0x%02X", bootError);
+        LOG_E("Boot error: 0x%04X", bootError);
         resonantRadio.deepSleep();
         powerManager.goToSleep();
     }
