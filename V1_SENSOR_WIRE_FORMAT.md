@@ -15,8 +15,9 @@
 3. [Encryption Layer](#3-encryption-layer)
 4. [Telemetry Frame (0x01)](#4-telemetry-frame-0x01)
 5. [Metrics Frame (0x02)](#5-metrics-frame-0x02)
-6. [Transmission Behavior](#6-transmission-behavior)
-7. [Decoding Examples](#7-decoding-examples)
+6. [Settings Report Frame (0x04)](#6-settings-report-frame-0x04)
+7. [Transmission Behavior](#7-transmission-behavior)
+8. [Decoding Examples](#8-decoding-examples)
 
 ---
 
@@ -42,7 +43,8 @@ All frames share a 20-byte overhead structure defined by `RESONANT_FRAME`. The d
 
 **Frame overhead**: 20 bytes (19 header + 1 checksum)  
 **Total frame size**: 20 + payload length  
-**Packet length field**: total_frame_size - 3
+**Packet length field**: total_frame_size - 3  
+**Max application payload (encrypted)**: 207 bytes (255 − 20 frame − 28 GCM)
 
 ---
 
@@ -187,27 +189,36 @@ Sent every wake cycle. Contains sensor readings.
 
 ## 5. Metrics Frame (0x02)
 
-Sent on first boot and user-button wake. Contains device health and identification data.
+Sent every N telemetry cycles (configurable via `metricsReportInterval` setting), on first boot, and on user-button wake. Contains the full 207-byte FRAM metrics region, which includes device identity, cumulative timing accumulators, battery voltage, and energy tracking.
 
-### Application Payload (9 bytes plaintext)
+The metrics frame payload is a direct read of the FRAM Metrics region (see `FRAM_MEMORY_MAP.md`). All multi-byte fields are big-endian.
+
+### Application Payload (207 bytes plaintext)
 
 ```
- Byte   Field              Type       Description
- ────   ─────              ────       ───────────────────────────────────────
- 0      Firmware version   uint8_t    Currently 1
- 1      Hardware version   uint8_t    Currently 1
- 2      Sensor type        uint8_t    Currently 0x01
- 3      Energy MSB         uint16_t   totalEnergy_mAh * 100, high byte
- 4      Energy LSB         uint16_t   totalEnergy_mAh * 100, low byte
- 5      Battery MSB        uint16_t   batteryVoltage_V * 100, high byte
- 6      Battery LSB        uint16_t   batteryVoltage_V * 100, low byte
- 7      Reserved           uint8_t    0x00
- 8      Reserved           uint8_t    0x00
+ Byte    Field                  Type       Description
+ ────    ─────                  ────       ───────────────────────────────────────
+ 0       metricsVersion         uint8_t    Metrics layout version (0x01)
+ 1       firmwareVersion        uint8_t    Firmware version
+ 2       hardwareVersion        uint8_t    Hardware version
+ 3       sensorType             uint8_t    Sensor type identifier
+ 4-5     batteryVoltage         uint16_t   Filtered lowest-known voltage (centivolts)
+ 6-9     totalTxTime            uint32_t   Cumulative TX time (ms)
+ 10-13   totalRxTime            uint32_t   Cumulative RX time (ms)
+ 14-17   totalActiveTime        uint32_t   Cumulative awake-not-TX/RX time (ms)
+ 18-21   totalSleepTime         uint32_t   Cumulative sleep time (seconds)
+ 22-25   cycleCount             uint32_t   Total wake cycles since first boot
+ 26-29   txCount                uint32_t   Total successful transmissions
+ 30      ackFailCount           uint8_t    Consecutive ACK failures
+ 31-32   ackFailTotal           uint16_t   Lifetime ACK failures
+ 33-34   telemetrySinceMetrics  uint16_t   Telemetry cycles since last metrics report
+ 35-36   bootCount              uint16_t   Cold boot count (non-deep-sleep resets)
+ 37-40   totalEnergy            uint32_t   Cumulative energy (microwatt-hours)
+ 41-50   reserved               —          Reserved for future universal metrics
+ 51-206  sensorSpecificMetrics  —          Sensor-type-specific metrics
 ```
 
-**Energy encoding**: Cumulative energy consumption in milliamp-hours, multiplied by 100, stored as unsigned 16-bit big-endian.
-
-**Battery voltage encoding**: Battery voltage in volts, multiplied by 100, stored as unsigned 16-bit big-endian. Measured via ADC with resistor divider correction (x2.2794 scaling factor).
+**Battery voltage encoding**: Voltage in volts × 100, stored as unsigned 16-bit big-endian. Filtered to track lowest-known voltage; jumps >0.30V indicate battery replacement.
 
 | Example Voltage | Encoded (hex) |
 |----------------|---------------|
@@ -215,94 +226,125 @@ Sent on first boot and user-button wake. Contains device health and identificati
 | 4.20 V | `0x01A4` (420) |
 | 2.80 V | `0x0118` (280) |
 
-### Encrypted Metrics Payload (37 bytes)
+**Energy encoding**: Cumulative energy in microwatt-hours as unsigned 32-bit big-endian.
+
+### Encrypted Metrics Payload (235 bytes)
 
 ```
- Offset   Length   Field
- ──────   ──────   ─────────────────────────
- 0-11     12       GCM IV
- 12-20    9        Ciphertext (encrypted metrics)
- 21-36    16       GCM Authentication Tag
+ Offset    Length   Field
+ ──────    ──────   ─────────────────────────
+ 0-11      12       GCM IV
+ 12-218    207      Ciphertext (encrypted metrics)
+ 219-234   16       GCM Authentication Tag
 ```
 
 ### Complete Metrics Frame (Encrypted)
 
-**Total size**: 57 bytes
+**Total size**: 255 bytes (maximum single LoRa packet)
 
 ```
- Offset   Length   Field                 Example Value
- ──────   ──────   ─────                 ─────────────
- 0        1        Header                0x85
- 1-2      2        Packet length         0x0036 (54)
- 3-6      4        Source ID             [MAC bytes 2-5]
- 7-10     4        Destination ID        0xFFFFFFFF (broadcast)
- 11       1        Frame type            0x02
- 12       1        Options               0x20 (no ACK)
- 13-16    4        Sequence number       [big-endian counter]
- 17       1        Total packets         0x01
- 18       1        Packet index          0x00
- 19-30    12       GCM IV                [random]
- 31-39    9        Ciphertext            [encrypted payload]
- 40-55    16       GCM Tag               [auth tag]
- 56       1        Checksum              [sum bytes 3-55 & 0xFF]
-```
-
-### Complete Metrics Frame (Plaintext Fallback)
-
-**Total size**: 29 bytes
-
-```
- Offset   Length   Field                 Example Value
- ──────   ──────   ─────                 ─────────────
- 0        1        Header                0x85
- 1-2      2        Packet length         0x001A (26)
- 3-6      4        Source ID             [MAC bytes 2-5]
- 7-10     4        Destination ID        0xFFFFFFFF (broadcast)
- 11       1        Frame type            0x02
- 12       1        Options               0x20
- 13-16    4        Sequence number       [big-endian counter]
- 17       1        Total packets         0x01
- 18       1        Packet index          0x00
- 19       1        Firmware version      0x01
- 20       1        Hardware version      0x01
- 21       1        Sensor type           0x01
- 22       1        Energy MSB            e.g. 0x00
- 23       1        Energy LSB            e.g. 0x64
- 24       1        Battery MSB           e.g. 0x01
- 25       1        Battery LSB           e.g. 0x74
- 26       1        Reserved              0x00
- 27       1        Reserved              0x00
- 28       1        Checksum              [sum bytes 3-27 & 0xFF]
+ Offset    Length   Field                 Example Value
+ ──────    ──────   ─────                 ─────────────
+ 0         1        Header                0x85
+ 1-2       2        Packet length         0x00FC (252)
+ 3-6       4        Source ID             [MAC bytes 2-5]
+ 7-10      4        Destination ID        0xFFFFFFFF (broadcast)
+ 11        1        Frame type            0x02
+ 12        1        Options               0x20 (no ACK)
+ 13-16     4        Sequence number       [big-endian counter]
+ 17        1        Total packets         0x01
+ 18        1        Packet index          0x00
+ 19-30     12       GCM IV                [random]
+ 31-237    207      Ciphertext            [encrypted metrics]
+ 238-253   16       GCM Tag               [auth tag]
+ 254       1        Checksum              [sum bytes 3-253 & 0xFF]
 ```
 
 ---
 
-## 6. Transmission Behavior
+## 6. Settings Report Frame (0x04)
+
+Sent on gateway command request. Contains the full 207-byte FRAM Settings region, which includes all configurable device parameters. This allows the gateway to read the complete device configuration.
+
+The settings frame payload is a direct read of the FRAM Active Settings region (see `FRAM_MEMORY_MAP.md`). All multi-byte fields are big-endian.
+
+### Application Payload (207 bytes plaintext)
+
+```
+ Byte    Field                    Type       Description
+ ────    ─────                    ────       ───────────────────────────────────────
+ 0       settingsVersion          uint8_t    Settings map version (0x01)
+ 1-2     telemetryInterval        uint16_t   Telemetry report interval (seconds)
+ 3-4     telemetryMaxWake         uint16_t   Max awake time for telemetry cycle (ms)
+ 5       txPower                  uint8_t    TX power dBm (2-22)
+ 6       spreadingFactor          uint8_t    LoRa spreading factor (7-12)
+ 7       bandwidth                uint8_t    0=125kHz, 1=250kHz, 2=500kHz
+ 8-11    frequency                uint32_t   Radio center frequency in Hz
+ 12      codingRate               uint8_t    LoRa coding rate
+ 13-14   waitAfterTx              uint16_t   RX listen after metrics TX (ms)
+ 15      ackFailThreshold         uint8_t    Consecutive ACK failures to orphan
+ 16      telemetryAckRequired     uint8_t    Require ACK on telemetry (0=no, 1=yes)
+ 17-18   metricsReportInterval    uint16_t   Metrics every N telemetry cycles
+ 19-22   parentID                 uint32_t   Adopted gateway ID
+ 23-32   reserved                 —          Reserved for future universal settings
+ 33      sensorType               uint8_t    Sensor type identifier
+ 34      firmwareVersion          uint8_t    Firmware version
+ 35      hardwareVersion          uint8_t    Hardware version
+ 36-206  sensorSpecificSettings   —          Sensor-type-specific settings
+```
+
+### Complete Settings Frame (Encrypted)
+
+**Total size**: 255 bytes (maximum single LoRa packet)
+
+Frame structure is identical to the Metrics Frame but with frame type `0x04`.
+
+---
+
+## 7. Transmission Behavior
 
 ### Wake Sources and Frame Sequences
 
 | Wake Source | GPIO | Mechanism | Frames Sent | Description |
 |-------------|------|-----------|-------------|-------------|
-| Timer | -- | `esp_sleep_enable_timer_wakeup` | Telemetry | Periodic interval reporting |
+| Timer | -- | `esp_sleep_enable_timer_wakeup` | Telemetry, then Metrics (if due) | Periodic interval reporting |
 | User button | GPIO2 | ext0 (level, HIGH) | Telemetry, then Metrics | Manual trigger, full report |
-| Contact sensor | GPIO14 | ext1 (dynamic polarity) | Telemetry | State-change reporting |
+| Contact sensor | GPIO14 | ext1 (dynamic polarity) | Telemetry, then Metrics (if due) | State-change reporting |
 | Power-on | -- | `ESP_RST_POWERON` | Telemetry, then Metrics | Initial boot, full report |
+
+### Metrics Reporting Interval
+
+Metrics are sent based on a configurable multiplier of the telemetry interval:
+
+- `metricsReportInterval` = N means metrics are sent every N telemetry transmissions
+- Example: telemetryInterval=600s, metricsReportInterval=6 → metrics every hour
+- Metrics are always sent on first boot and user-button wake regardless of the counter
+- The `telemetrySinceMetrics` counter in the Metrics region tracks progress
 
 ### Transmission Order
 
-When both telemetry and metrics are sent in a single wake cycle:
-
 ```
  1. Sensor wakes
- 2. TMP112 temperature reading requested
- 3. Contact pin (GPIO14) state read
- 4. Telemetry frame transmitted (temperature + contact)
- 5. If ACK required: wait for acknowledgement
- 6. Metrics frame transmitted (versions + energy + battery)
- 7. Metrics time updated in NVS
- 8. Radio enters deep sleep
- 9. MCU enters deep sleep
+ 2. FRAM scratchpad checked for brownout (lastTxStatus == 1)
+ 3. Battery voltage read and filtered
+ 4. TMP112 temperature reading requested
+ 5. Contact pin (GPIO14) state read
+ 6. Telemetry frame transmitted (temperature + contact)
+ 7. telemetrySinceMetrics counter incremented
+ 8. If ACK required: wait for acknowledgement
+ 9. If metrics due (counter >= interval) OR first boot OR button wake:
+    a. Metrics frame transmitted (full 207-byte FRAM metrics region)
+    b. telemetrySinceMetrics counter reset to 0
+    c. Listen for commands (waitAfterTx duration)
+10. Accumulate TX/RX/Active time to FRAM metrics
+11. Flush all dirty FRAM regions
+12. Radio enters deep sleep
+13. MCU enters deep sleep
 ```
+
+### Brownout Detection
+
+Before each TX attempt, the firmware writes `lastTxStatus = 1` to the FRAM scratchpad. On TX success, it writes `2`; on detected failure, `3`. On wake, if `lastTxStatus == 1`, the previous TX never completed — likely a brownout. The device enters recovery mode with exponentially increasing sleep intervals.
 
 ### Contact Sensor Wake (ext1) - Edge Detection
 
@@ -317,7 +359,7 @@ This ensures the device wakes **once per state change**, not continuously while 
 
 ---
 
-## 7. Decoding Examples
+## 8. Decoding Examples
 
 ### Decoding Telemetry Payload (Plaintext)
 
@@ -347,15 +389,27 @@ Given the full frame, extract bytes [19..49] as the encrypted payload:
 
 ### Decoding Metrics Payload (Plaintext)
 
-Given raw payload bytes: `01 01 01 00 64 01 74 00 00`
+Given the first 51 bytes of the 207-byte metrics payload:
 
 ```
-Firmware version:  0x01 = 1
-Hardware version:  0x01 = 1
-Sensor type:       0x01
-Energy:            (0x00 << 8) | 0x64 = 100 -> 100 / 100.0 = 1.00 mAh
-Battery voltage:   (0x01 << 8) | 0x74 = 372 -> 372 / 100.0 = 3.72 V
-Reserved:          0x00, 0x00
+Byte 0:     metricsVersion  = 0x01
+Byte 1:     firmwareVersion = 0x01
+Byte 2:     hardwareVersion = 0x01
+Byte 3:     sensorType      = 0x01
+Bytes 4-5:  batteryVoltage  = (0x01 << 8) | 0x74 = 372 → 3.72 V
+Bytes 6-9:  totalTxTime     = 0x00001A2B = 6699 ms
+Bytes 10-13: totalRxTime    = 0x0000C350 = 50000 ms
+Bytes 14-17: totalActiveTime = 0x00005DC0 = 24000 ms
+Bytes 18-21: totalSleepTime = 0x00015180 = 86400 seconds (1 day)
+Bytes 22-25: cycleCount     = 0x00000090 = 144 cycles
+Bytes 26-29: txCount        = 0x0000008E = 142 transmissions
+Byte 30:    ackFailCount    = 0x00 (no consecutive failures)
+Bytes 31-32: ackFailTotal   = 0x0002 = 2 lifetime failures
+Bytes 33-34: telemetrySinceMetrics = 0x0003 = 3 since last report
+Bytes 35-36: bootCount      = 0x0001 = 1 cold boot
+Bytes 37-40: totalEnergy    = 0x000186A0 = 100000 µWh = 100 mWh
+Bytes 41-50: reserved       = 0x00...
+Bytes 51-206: sensorSpecificMetrics (sensor-type dependent)
 ```
 
 ### Checksum Verification
@@ -376,9 +430,10 @@ valid = (expected == actual)
 | Frame | Plaintext Size | Encrypted Size |
 |-------|---------------|----------------|
 | Telemetry (0x01) | 23 bytes | 51 bytes |
-| Metrics (0x02) | 29 bytes | 57 bytes |
+| Metrics (0x02) | 227 bytes | 255 bytes |
+| Settings Report (0x04) | 227 bytes | 255 bytes |
 
 ---
 
 *Document generated from v1_resonant_device firmware implementation.*  
-*Source files: `main.cpp`, `main.h`, `resonant_frame.cpp`, `resonant_encryption.h`, `Sensor.cpp`, `resonant_power_manager.cpp`*
+*Source files: `main.cpp`, `main.h`, `resonant_fram_storage.h`, `resonant_frame.cpp`, `resonant_encryption.h`, `Sensor.cpp`, `resonant_power_manager.cpp`*

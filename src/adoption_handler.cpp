@@ -1,7 +1,7 @@
 #include "adoption_handler.h"
 #include <esp_efuse.h>
 
-void DeviceAdoptionHandler::init(ResonantEncryption* enc, ResonantStorage* store,
+void DeviceAdoptionHandler::init(ResonantEncryption* enc, ResonantFRAMStorage* store,
                                   ResonantFrame* frame, ResonantLRRadio* radio,
                                   ResonantPowerManager* power) {
     _enc = enc;
@@ -19,8 +19,6 @@ bool DeviceAdoptionHandler::handleAdoptionRequest(const uint8_t* data, size_t da
     LOG_I("Source ID: %02X:%02X:%02X:%02X",
         sourceID[0], sourceID[1], sourceID[2], sourceID[3]);
 
-    // Spec payload: gateway_id(4) + ecdh_pubkey(64) + nonce(16) + ecdsa_sig(64) +
-    //               tx_channel(1) + tx_interval(2) + cert_length(2) + gateway_der_cert(L)
     constexpr size_t MIN_ADOPTION_REQ_LEN = 4 + 64 + 16 + 64 + 1 + 2 + 2;
 
     if (_enc->isInitialized() && dataLength >= MIN_ADOPTION_REQ_LEN && data != nullptr) {
@@ -42,7 +40,6 @@ bool DeviceAdoptionHandler::handleAdoptionRequest(const uint8_t* data, size_t da
             gatewayCert = data + offset;
         }
 
-        // Verify gateway certificate chain
         bool certVerified = false;
         if (gatewayCert != nullptr && certLength > 0) {
             if (_enc->verifyCertChain(gatewayCert, certLength)) {
@@ -55,7 +52,6 @@ bool DeviceAdoptionHandler::handleAdoptionRequest(const uint8_t* data, size_t da
             LOG_D("No gateway cert in payload, skipping chain verification");
         }
 
-        // Extract gateway long-term public key from cert and verify ECDSA signature
         bool sigVerified = false;
         if (certVerified && gatewayCert != nullptr) {
             uint8_t gwLongTermPubKey[ResonantEncryption::P256_PUBKEY_SIZE];
@@ -85,8 +81,9 @@ bool DeviceAdoptionHandler::handleAdoptionRequest(const uint8_t* data, size_t da
             return false;
         }
 
-        // ECDH + HKDF
-        _store->setParentId(gatewayId);
+        _store->setParentID(gatewayId);
+        _store->resetAckFailCount();
+        _store->setTxSequenceNumber(1);
         txSequenceNumber = 1;
         LOG_I("Parent ID stored, sequence number reset");
 
@@ -111,7 +108,9 @@ bool DeviceAdoptionHandler::handleAdoptionRequest(const uint8_t* data, size_t da
         memcpy(gwIdCopy, gatewayId, 4);
         sendAdoptionAcceptCrypto(gwIdCopy, challengeNonce, txSequenceNumber, txContext);
     } else {
-        _store->setParentId(sourceID);
+        _store->setParentID(sourceID);
+        _store->resetAckFailCount();
+        _store->setTxSequenceNumber(1);
         txSequenceNumber = 1;
         LOG_I("Parent ID stored (non-crypto adoption), sequence number reset");
         if (dataLength > 0 && data != nullptr) {
@@ -145,7 +144,7 @@ void DeviceAdoptionHandler::sendAdoptionAdvertise(uint8_t sensorType, uint8_t hw
     }
 
     uint8_t capabilities = 0x01;
-    uint16_t txInterval = _store->getUInt16(StorageKeys::SLEEP_DURATION, 5);
+    uint16_t txInterval = _store->settings().telemetryInterval;
 
     FrameData frame = _frame->buildDiscoveryFrame(
         sensorType, hwVersion, fwVersion,
@@ -166,6 +165,7 @@ void DeviceAdoptionHandler::sendAdoptionAccept(uint8_t destinationID[4],
     uint8_t options = ResonantFrame::buildOptionsV1(false);
     FrameData frame = _frame->buildAdoptionAcceptFrame(acceptData, 1, destinationID, options, txSequenceNumber);
     txSequenceNumber++;
+    _store->setTxSequenceNumber(txSequenceNumber);
     txContext = TxContext::ADOPTION_ACCEPT;
     _radio->send(frame.frame, frame.size);
     delete[] frame.frame;
@@ -240,6 +240,7 @@ void DeviceAdoptionHandler::sendAdoptionAcceptCrypto(uint8_t destinationID[4],
     FrameData frame = _frame->buildAdoptionAcceptFrame(
         payload, payloadSize, destinationID, options, txSequenceNumber);
     txSequenceNumber++;
+    _store->setTxSequenceNumber(txSequenceNumber);
     txContext = TxContext::ADOPTION_ACCEPT;
     _radio->send(frame.frame, frame.size, destinationID, false);
     delete[] frame.frame;

@@ -6,7 +6,7 @@
 #include "resonant_lr_radio.h"
 #include "resonant_frame.h"
 #include "resonant_power_manager.h"
-#include "resonant_storage.h"
+#include "resonant_fram_storage.h"
 #include "resonant_encryption.h"
 #include "resonant_log.h"
 #include "adoption_handler.h"
@@ -22,8 +22,10 @@ constexpr uint8_t FIRMWARE_VERSION = 1;
 constexpr uint8_t HARDWARE_VERSION = 1;
 constexpr uint8_t SENSOR_TYPE = 0x01;
 
-// GCM adds 12-byte IV + 16-byte tag to every encrypted payload
 constexpr size_t ENCRYPTION_OVERHEAD = ResonantEncryption::WIRE_OVERHEAD;
+
+// Voltage delta threshold for battery swap detection (centivolts)
+constexpr uint16_t BATTERY_SWAP_DELTA_CV = 30;
 
 // ============================================================================
 // Global Instances
@@ -31,7 +33,7 @@ constexpr size_t ENCRYPTION_OVERHEAD = ResonantEncryption::WIRE_OVERHEAD;
 inline ResonantLRRadio resonantRadio;
 inline ResonantFrame resonantFrame;
 inline ResonantPowerManager powerManager;
-inline ResonantStorage storage;
+inline ResonantFRAMStorage framStorage;
 inline ResonantEncryption encryption;
 inline DeviceAdoptionHandler adoptionHandler;
 inline TMP112Sensor tempSensor;
@@ -46,12 +48,9 @@ inline volatile bool sensorDataReady = false;
 inline float lastTemperatureC = 0.0f;
 inline bool lastContactClosed = false;
 
-inline bool telemetryAckRequired = false;
 inline bool firstBoot = true;
 inline bool interruptWake = false;
 inline bool contactWake = false;
-inline uint32_t txSequenceNumber = 1;
-inline uint32_t rxLastSequenceNumber = 0;
 
 // ============================================================================
 // Background Tasks
@@ -78,6 +77,16 @@ void handleCommand(uint8_t commandId, uint8_t* params, size_t paramsLength, uint
 // Device Identity Helper
 // ============================================================================
 void getDeviceSensorId(uint8_t* sensorId);
+
+// ============================================================================
+// Battery Voltage Filtering
+// ============================================================================
+void updateBatteryVoltage();
+
+// ============================================================================
+// Pre-Sleep Accumulation
+// ============================================================================
+void accumulateMetricsBeforeSleep();
 
 namespace BootError {
     constexpr uint16_t STORAGE    = (1 << 0);

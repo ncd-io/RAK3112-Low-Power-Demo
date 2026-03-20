@@ -3,7 +3,7 @@
 
 #include <Arduino.h>
 #include "resonant_encryption.h"
-#include "resonant_storage.h"
+#include "resonant_fram_storage.h"
 #include "resonant_frame.h"
 #include "resonant_lr_radio.h"
 #include "resonant_power_manager.h"
@@ -21,11 +21,10 @@ enum class TxContext {
 
 class DeviceAdoptionHandler {
 public:
-    void init(ResonantEncryption* enc, ResonantStorage* store,
+    void init(ResonantEncryption* enc, ResonantFRAMStorage* store,
               ResonantFrame* frame, ResonantLRRadio* radio,
               ResonantPowerManager* power);
 
-    // Process an incoming adoption request frame. Returns true if adoption succeeded.
     bool handleAdoptionRequest(const uint8_t* data, size_t dataLength,
                                const uint8_t* sourceID,
                                uint32_t& txSequenceNumber,
@@ -46,7 +45,7 @@ public:
 
 private:
     ResonantEncryption* _enc = nullptr;
-    ResonantStorage* _store = nullptr;
+    ResonantFRAMStorage* _store = nullptr;
     ResonantFrame* _frame = nullptr;
     ResonantLRRadio* _radio = nullptr;
     ResonantPowerManager* _power = nullptr;

@@ -1,0 +1,19 @@
+Start Index	End Index	Size	Name	Type	Default	Notes
+0	0	1	settingsVersion	uint8_t	0x01	Map Version
+1	2	2	telemetryInterval	uint16_t	0x0005	Telemetry Report Interval in Seconds
+3	4	2	telemetryMaxWake	uint16_t	0x1388	Maximum Awake Time for Telemetry Wake Cycles in milliseconds
+5	5	1	txPower	uint8_t	0x16(22 dBm)	Tx Power dBm(2-22)
+6	6	1	spreadingFactor	uint8_t	0x07(SF7)	LoRa SpreadingFactor(7-12)
+7	7	1	bandwidth	uint8_t	0x00(125kHz)	0=125, 1-250, 2=500kHz
+8	11	4	frequency	uint32_t	0x36A48C00 (915 MHz)	Radio Center frequency in Hz
+12	12	1	codingRate	uint8_t	0x01	Coding Rate
+13	14	2	waitAfterTx	uint16_t	0x1F40(8000)	Rx duration after Metrics report transmission(listen for command time) in milliseconds
+15	15	1	ackFailThreshold	uint8_t	0x05	Ack Failure threshold to orphan(begin adoption advertise)
+16	16	1	telemetryAckRequired	uint8_t	0x00(false)	Require ack on all telemetry report
+17	18	2	metricsReportInterval	uint16_t	0x06	Metrics interval multiplier based on Telemetry interval(example: telemetryInverval = 10, metrics reportInterval = 6 metrics would be reported every 60 seconds)
+19	22	4	parentID	uint32_t	0xFFFFFFFF	Parent ID(Gateway ID)
+23	32	10	reserved		0x00	Reserved for future universal settings
+33	33	1	sensorType	uint8_t	0x00	Sensor Type
+34	34	1	firwmareVersion	uint8_t	0x00	Sensor Firmware Version
+35	35	1	hardwareVersion	uint8_t	0x00	Sensor Hardware Version
+36	206	171	sensorSpecificSettings		0x00	Settings Specifc to Sensor Type
