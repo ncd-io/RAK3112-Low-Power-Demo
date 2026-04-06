@@ -13,6 +13,7 @@ enum class TxContext {
     NONE,
     TELEMETRY,
     METRICS,
+    SETTINGS_REPORT,
     COMMAND_RESPONSE,
     ACK,
     ADOPTION_ADVERTISE,

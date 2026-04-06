@@ -45,6 +45,9 @@ inline MB85RS64V fram;
 // ============================================================================
 inline volatile bool transmissionComplete = false;
 inline volatile bool sensorDataReady = false;
+inline volatile bool pendingSettingsReport = false;
+inline volatile bool pendingRadioConfigApply = false;
+inline RadioConfig pendingRadioConfig;
 inline float lastTemperatureC = 0.0f;
 inline bool lastContactClosed = false;
 
@@ -67,6 +70,7 @@ void onRadioError(uint8_t errorCode, const char* message);
 void onSensorDataReady(float temperatureC, bool contactClosed);
 void sendEncryptedTelemetry(const uint8_t* payload, size_t payloadLen, uint8_t parentId[4]);
 void sendMetricsFrame(void);
+void sendSettingsFrame(void);
 
 // ============================================================================
 // Command Processing

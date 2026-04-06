@@ -425,6 +425,67 @@ valid = (expected == actual)
 
 ---
 
+## 9. Command Frame (0x08) — Downlink
+
+Command frames are sent from the gateway to the device via the modem. The device listens for commands after transmitting metrics. The command frame payload (after decryption) is:
+
+```
+Byte   Field       Description
+────   ─────       ───────────────────────────────
+0      commandId   Command identifier
+1–N    params      Command-specific parameters (may be empty)
+```
+
+### Command IDs
+
+| ID     | Name                  | Params (bytes) | Description                                      |
+| ------ | --------------------- | -------------- | ------------------------------------------------ |
+| `0x01` | Reset Energy          | 0              | Zeros all energy/timing counters in metrics       |
+| `0x02` | Factory Reset         | 0              | Restores factory settings, resets metrics          |
+| `0x03` | Set Sleep Duration    | 2              | Reserved (use Configure Settings instead)          |
+| `0x04` | Request Metrics       | 0              | Reserved                                           |
+| `0x05` | Set TX Power          | 1              | Reserved (use Configure Settings instead)          |
+| `0x06` | Sleep Now             | 0              | Immediately go to deep sleep (no response sent)    |
+| `0x07` | Configure Settings    | 207            | Full settings blob — see below                     |
+| `0x08` | Request Settings      | 0              | Device replies with Settings Report frame (0x04)   |
+
+### CMD_CONFIGURE_SETTINGS (0x07)
+
+The gateway sends the complete 207-byte settings region as the command parameter. The byte layout matches `FRAM_MEMORY_MAP.md` Section 1, all multi-byte fields in big-endian byte order.
+
+**Plaintext command payload**: `[0x07] + [207 settings bytes]` = 208 bytes  
+**Encrypted on wire**: `IV(12) + ciphertext(208) + tag(16)` = 236 bytes  
+**Frame size**: 236 + 20 overhead = 256 bytes (requires 2-packet multi-packet transmission)
+
+**Protected fields** (device preserves its own values regardless of incoming data):
+- `parentID` (offset 19–22) — managed by adoption protocol
+- `sensorType` (offset 33) — hardware identity
+- `firmwareVersion` (offset 34) — set by firmware build
+- `hardwareVersion` (offset 35) — set by hardware revision
+
+**Validation**: `telemetryInterval` must be > 0, `telemetryMaxWake` must be >= 1000 ms.
+
+**Behavior**: Settings are written to FRAM and radio configuration is applied immediately. The device sends a command response with the result, then goes to sleep.
+
+### Command Response (0x03) — Uplink
+
+```
+Byte   Field          Description
+────   ─────          ───────────────────────────────
+0      commandId      Echo of the command that was processed
+1      responseCode   0x00=success, 0x01=unknown cmd, 0x02=invalid params, 0x03=failed
+```
+
+**Exceptions** (no command response sent):
+- `CMD_SLEEP_NOW` (0x06) — device goes directly to sleep
+- `CMD_REQUEST_SETTINGS` (0x08) — device replies with a Settings Report frame (0x04) instead
+
+### CMD_REQUEST_SETTINGS (0x08)
+
+No parameters. The device responds by transmitting its full 207-byte active settings as a Settings Report frame (frame type `0x04`). The settings payload is encrypted with AES-128-GCM and the byte layout matches `FRAM_MEMORY_MAP.md` Section 1, all multi-byte fields in big-endian byte order.
+
+---
+
 ## Frame Size Summary
 
 | Frame | Plaintext Size | Encrypted Size |
@@ -432,6 +493,8 @@ valid = (expected == actual)
 | Telemetry (0x01) | 23 bytes | 51 bytes |
 | Metrics (0x02) | 227 bytes | 255 bytes |
 | Settings Report (0x04) | 227 bytes | 255 bytes |
+| Command (0x08, downlink) | 21–228 bytes | 49–256 bytes |
+| Command Response (0x03) | 22 bytes | 50 bytes |
 
 ---
 

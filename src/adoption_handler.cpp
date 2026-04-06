@@ -94,6 +94,15 @@ bool DeviceAdoptionHandler::handleAdoptionRequest(const uint8_t* data, size_t da
         if (_enc->performECDH(gatewayPubKey, sharedSecret)) {
             if (_enc->deriveSessionKey(sharedSecret, sensorId, 4, gatewayId, 4)) {
                 LOG_I("Session key derived from adoption handshake");
+#ifdef ATECC_MOCK
+                uint8_t keyBuf[ResonantEncryption::AES128_KEY_SIZE];
+                if (_enc->readSlotKey(ResonantEncryption::SLOT_SESSION_KEY,
+                                      keyBuf, sizeof(keyBuf))) {
+                    _store->setMockSessionKey(keyBuf, sizeof(keyBuf));
+                    LOG_I("Session key persisted to FRAM scratchpad (mock)");
+                }
+                memset(keyBuf, 0, sizeof(keyBuf));
+#endif
             } else {
                 LOG_W("Session key derivation failed");
             }

@@ -100,7 +100,8 @@ Starts at FRAM address `0x026C`. Firmware-private working memory that persists a
 | 5       | 1    | cycleFlags            | uint8_t  | `0x00`       | Bitfield: b0=metricsSent, b1=cmdReceived, b2=ackReceived      |
 | 6–7     | 2    | rawBatteryVoltage     | uint16_t | `0x0000`     | Most recent ADC reading (centivolts)                          |
 | 8–11    | 4    | txSequenceNumber      | uint32_t | `0x00000001` | Monotonic TX sequence counter                                 |
-| 12–31   | 20   | reserved              | —        | `0x00`       | Reserved for future scratchpad fields                         |
+| 12–27   | 16   | mockSessionKey        | uint8_t[16] | `0x00`    | AES-128 session key (ATECC_MOCK only — removed with ATECC608B) |
+| 28–31   | 4    | reserved              | —        | `0x00`       | Reserved for future scratchpad fields                         |
 | 32–399  | 368  | sensorReadingBuffer   | —        | `0x00`       | Available for buffered sensor readings and future growth      |
 
 **Universal fields**: bytes 0–31 (32 bytes)  

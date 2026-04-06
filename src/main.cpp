@@ -115,6 +115,11 @@ void setup()
     // Clear adoption on reset for test purposes
     if (resetReason != ESP_RST_DEEPSLEEP && framStorage.isAdopted()) {
         framStorage.clearParentID();
+#ifdef ATECC_MOCK
+        uint8_t zeroKey[ResonantEncryption::AES128_KEY_SIZE] = {0};
+        framStorage.setMockSessionKey(zeroKey, sizeof(zeroKey));
+        LOG_I("Mock session key cleared (adoption reset)");
+#endif
     }
 
     // Start radio init on Core 0
@@ -145,9 +150,20 @@ void setup()
         memset(testKey, 0, sizeof(testKey));
         LOG_I("Test session key loaded for unadopted testing");
     }
+#ifdef ATECC_MOCK
+    else if (framStorage.hasMockSessionKey()) {
+        uint8_t savedKey[ResonantEncryption::AES128_KEY_SIZE];
+        framStorage.getMockSessionKey(savedKey, sizeof(savedKey));
+        encryption.storeKey(savedKey, sizeof(savedKey),
+                            ResonantEncryption::SLOT_SESSION_KEY);
+        memset(savedKey, 0, sizeof(savedKey));
+        LOG_I("Session key restored from FRAM (mock)");
+    }
+#endif
 
-    // Wait for radio init on Core 0
-    while (!resonantRadio.radioInitialized && !powerManager.checkWakeTimeout()) {
+    // Wait for radio init on Core 0 (fixed 3s ceiling, independent of wake timeout)
+    unsigned long radioWaitStart = millis();
+    while (!resonantRadio.radioInitialized && (millis() - radioWaitStart < 3000)) {
         delay(1);
     }
     if (!resonantRadio.radioInitialized) {
@@ -225,11 +241,28 @@ void loop()
         sendEncryptedTelemetry(payload, 3, parentId);
     }
 
-    if (powerManager.checkWakeTimeout()) {
-        LOG_I("Wake timeout reached");
+    if (pendingSettingsReport && !resonantRadio.isBusy()) {
+        pendingSettingsReport = false;
+        LOG_I("Sending settings report");
+        delay(50);
+        sendSettingsFrame();
     }
 
-    if (powerManager.shouldSleep() && resonantRadio.isTransmissionComplete()) {
+    bool telemetryOnlyCycle = framStorage.isAdopted()
+                           && !firstBoot
+                           && !interruptWake
+                           && currentTxContext != TxContext::ADOPTION_ADVERTISE
+                           && currentTxContext != TxContext::ADOPTION_ACCEPT
+                           && currentTxContext != TxContext::METRICS
+                           && currentTxContext != TxContext::SETTINGS_REPORT
+                           && currentTxContext != TxContext::COMMAND_RESPONSE;
+
+    if (telemetryOnlyCycle && powerManager.checkWakeTimeout()) {
+        LOG_I("Wake timeout reached (telemetry-only cycle)");
+    }
+
+    if (powerManager.shouldSleep() && !resonantRadio.isBusy()
+        && resonantRadio.isTransmissionComplete()) {
         accumulateMetricsBeforeSleep();
         framStorage.flush();
         resonantRadio.deepSleep();
@@ -263,6 +296,48 @@ void handleCommand(uint8_t commandId, uint8_t* params, size_t paramsLength, uint
             framStorage.factoryReset();
             LOG_I("Command: Factory reset executed");
             break;
+
+        case ResonantFrame::CMD_SLEEP_NOW:
+            LOG_I("Command: Sleep now — skipping response to save power");
+            powerManager.markRxComplete();
+            accumulateMetricsBeforeSleep();
+            framStorage.flush();
+            resonantRadio.deepSleep();
+            powerManager.goToSleep();
+            return;
+
+        case ResonantFrame::CMD_CONFIGURE_SETTINGS: {
+            if (paramsLength != 207) {
+                responseCode = ResonantFrame::CMD_RESPONSE_INVALID_PARAMS;
+                LOG_W("Configure settings: expected 207 bytes, got %zu", paramsLength);
+                break;
+            }
+            if (!framStorage.applySettingsFromWire(params, paramsLength)) {
+                responseCode = ResonantFrame::CMD_RESPONSE_FAILED;
+                break;
+            }
+            framStorage.flush();
+
+            pendingRadioConfig = resonantRadio.getConfig();
+            pendingRadioConfig.txPower = framStorage.settings().txPower;
+            pendingRadioConfig.loraSpreadingFactor = framStorage.settings().spreadingFactor;
+            pendingRadioConfig.loraBandwidth = framStorage.settings().bandwidth;
+            pendingRadioConfig.frequency = framStorage.settings().frequency;
+            pendingRadioConfig.loraCodingRate = framStorage.settings().codingRate;
+
+            powerManager.setSleepDuration(framStorage.settings().telemetryInterval);
+            powerManager.extendWakeTimeout(framStorage.settings().telemetryMaxWake);
+
+            LOG_I("Settings applied from wire (radio config deferred until after TX)");
+            pendingRadioConfigApply = true;
+            pendingSettingsReport = true;
+            return;
+        }
+
+        case ResonantFrame::CMD_REQUEST_SETTINGS:
+            LOG_I("Command: Request settings");
+            pendingSettingsReport = true;
+            return;
 
         default:
             responseCode = ResonantFrame::CMD_RESPONSE_UNKNOWN_CMD;
@@ -309,8 +384,9 @@ void onDataReceived(ValidateFrameResult& result, uint8_t* data, size_t dataLengt
 {
     LOG_I("\n=== Data Received ===");
     LOG_I("RSSI: %d dBm, SNR: %d dB", rssi, snr);
-    LOG_D("Frame Type: 0x%02X, Options: 0x%02X", result.frameType, result.options);
-    LOG_D("Data Length: %zu bytes", dataLength);
+    LOG_I("Frame Type: 0x%02X, Options: 0x%02X", result.frameType, result.options);
+    LOG_I("Data Length: %zu bytes", dataLength);
+    LOG_I("Timestamp: %lu", millis());
 
     if (result.frameType == resonantFrame.acknowledgementFrameType) {
         LOG_I("ACK received!");
@@ -330,6 +406,7 @@ void onDataReceived(ValidateFrameResult& result, uint8_t* data, size_t dataLengt
     } else if (result.frameType == resonantFrame.commandFrameType) {
         LOG_I("Command frame received");
         framStorage.addCycleFlag(CycleFlag::CMD_RECEIVED);
+        powerManager.extendWakeTimeout(framStorage.settings().telemetryMaxWake);
 
         if (encryption.isInitialized() && dataLength > ENCRYPTION_OVERHEAD) {
             uint8_t plaintext[dataLength];
@@ -356,7 +433,7 @@ void onDataReceived(ValidateFrameResult& result, uint8_t* data, size_t dataLengt
 
     } else if (result.frameType == resonantFrame.adoptionRequestFrameType) {
         powerManager.clearSleepRequest();
-        powerManager.setWakeTimeout(millis() + 10000);
+        powerManager.setWakeTimeout(10000);
         uint32_t seq = framStorage.scratchpad().txSequenceNumber;
         adoptionHandler.handleAdoptionRequest(data, dataLength, result.sourceID,
                                                seq, currentTxContext);
@@ -384,6 +461,7 @@ void onTxComplete(bool success, size_t bytesSent, uint8_t packetCount)
     LOG_I("Bytes sent: %zu", bytesSent);
     LOG_I("Packets: %d", packetCount);
     LOG_I("Total TX time: %lu ms", totalTxTime);
+    LOG_I("Timestamp: %lu", millis());
 
     if (packetCount > 1) {
         float throughput = (bytesSent * 1000.0f) / totalTxTime;
@@ -428,6 +506,16 @@ void onTxComplete(bool success, size_t bytesSent, uint8_t packetCount)
             powerManager.markRxStart();
             resonantRadio.startRx(framStorage.getWaitAfterTx());
             break;
+        case TxContext::SETTINGS_REPORT:
+            LOG_I("Settings report TX complete");
+            if (pendingRadioConfigApply) {
+                pendingRadioConfigApply = false;
+                resonantRadio.setConfig(pendingRadioConfig);
+                resonantRadio.applyConfig();
+                LOG_I("Deferred radio config applied after settings report");
+            }
+            powerManager.requestSleep();
+            break;
         case TxContext::COMMAND_RESPONSE:
             powerManager.requestSleep();
             break;
@@ -442,7 +530,7 @@ void onTxComplete(bool success, size_t bytesSent, uint8_t packetCount)
         case TxContext::ADOPTION_ACCEPT:
             LOG_I("Adoption accept sent, sending initial metrics...");
             powerManager.clearSleepRequest();
-            powerManager.setWakeTimeout(millis() + 10000);
+            powerManager.setWakeTimeout(10000);
             sendMetricsFrame();
             break;
         default:
@@ -594,6 +682,47 @@ void sendMetricsFrame(void)
         currentTxContext = TxContext::METRICS;
         resonantRadio.send(metricsFrame.frame, metricsFrame.size);
         delete[] metricsFrame.frame;
+    }
+}
+
+// ============================================================================
+// Send Settings Report Frame
+// ============================================================================
+void sendSettingsFrame(void)
+{
+    framStorage.flush();
+    framStorage.preparePayloads();
+
+    const uint8_t* settingsData = framStorage.getSettingsPayload();
+    size_t settingsLen = ResonantFRAMStorage::PAYLOAD_SIZE;
+
+    uint8_t destinationID[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+    uint8_t* encPayload = nullptr;
+    size_t encLen = 0;
+
+    uint8_t opts = ResonantFrame::buildOptionsV1(false);
+    uint8_t sensorId[4];
+    getDeviceSensorId(sensorId);
+    uint32_t seq = framStorage.getNextTxSequenceNumber();
+
+    if (encryption.isInitialized() &&
+        encryption.encryptForWire(settingsData, settingsLen,
+                       resonantFrame.configAdvertisementFrameType, sensorId, seq,
+                       &encPayload, &encLen)) {
+        FrameData frame = resonantFrame.buildConfigAdvertisementFrame(
+            encPayload, encLen, destinationID, opts, seq);
+        currentTxContext = TxContext::SETTINGS_REPORT;
+        resonantRadio.send(frame.frame, frame.size);
+        delete[] frame.frame;
+        delete[] encPayload;
+        LOG_I("Encrypted settings report sent (%zu bytes)", encLen);
+    } else {
+        FrameData frame = resonantFrame.buildConfigAdvertisementFrame(
+            const_cast<uint8_t*>(settingsData), settingsLen,
+            destinationID, opts, seq);
+        currentTxContext = TxContext::SETTINGS_REPORT;
+        resonantRadio.send(frame.frame, frame.size);
+        delete[] frame.frame;
     }
 }
 
